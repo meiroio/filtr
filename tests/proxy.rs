@@ -1646,6 +1646,92 @@ async fn incomplete_inventory_is_reported_without_database_guards() {
 }
 
 #[tokio::test]
+async fn upload_returns_readable_gaps_with_types_images_and_distinct_counts() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = Harness::start(&directory.path().join("sbom.json")).await;
+    assert!(app.status().await["inventory"].is_null());
+    let provenance =
+        json!([{"name":"api","image":"example/api:release","image_id":"sha256:example"}])
+            .to_string();
+    let source = json!([{"name":"filtr:inventory:source","value":"api"}]);
+    let sbom = json!({
+        "bomFormat":"CycloneDX", "specVersion":"1.6",
+        "metadata":{"properties":[{"name":"filtr:inventory:provenance","value":provenance}]},
+        "components":[
+            {"type":"operating-system","name":"alpine","version":"3.23.3","properties":source},
+            {"type":"library","name":"helper","purl":"pkg:golang/example/helper@UNKNOWN","properties":source},
+            {"type":"application","name":"unknown-app","properties":source}
+        ]
+    });
+    let response = app.upload(&sbom.to_string()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let report: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+    let inventory = &report["inventory"];
+    assert_eq!(inventory["identity_complete"], false);
+    assert_eq!(inventory["components"], 3);
+    assert_eq!(inventory["gap_count"], 4);
+    assert_eq!(inventory["components_with_gaps"], 3);
+    let gaps = inventory["gaps"].as_array().unwrap();
+    assert_eq!(gaps[0]["name"], "alpine");
+    assert_eq!(gaps[0]["component_type"], "operating-system");
+    assert_eq!(gaps[0]["reason"], "missing_purl");
+    assert_eq!(gaps[0]["installed_version"], "3.23.3");
+    assert!(
+        gaps[0]["suggested_action"]
+            .as_str()
+            .unwrap()
+            .contains("/etc/os-release")
+    );
+    assert_eq!(gaps[1]["package"], "pkg:golang/example/helper");
+    assert_eq!(gaps[1]["reason"], "missing_or_unknown_version");
+    assert_eq!(gaps[1]["installed_version"], "UNKNOWN");
+    assert_eq!(gaps[2]["component_index"], gaps[3]["component_index"]);
+    for gap in gaps {
+        assert_eq!(gap["sources"][0]["image"], "example/api:release");
+        assert_eq!(gap["sources"][0]["image_id"], "sha256:example");
+    }
+    assert_eq!(app.status().await["inventory"], *inventory);
+    let remediation: Value = serde_json::from_slice(
+        &app.client
+            .get(format!("{}/v1/remediation", app.admin))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(remediation["inventory_gaps"], inventory["gaps"]);
+    let refreshed: Value = serde_json::from_slice(
+        &app.client
+            .post(format!("{}/v1/refresh", app.admin))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(refreshed["inventory"], *inventory);
+    assert_eq!(refreshed["policy"]["ai"]["attempts"], json!([]));
+    assert_eq!(report["policy"]["ai"]["attempts"], json!([]));
+    assert_eq!(
+        report["policy"]["inventory_gaps"][0],
+        json!({"component_index":0,"reason":"missing_purl"})
+    );
+    let patched: Value =
+        serde_json::from_slice(&app.upload(PATCHED).await.bytes().await.unwrap()).unwrap();
+    assert_eq!(patched["inventory"]["identity_complete"], true);
+    assert_eq!(patched["inventory"]["gap_count"], 0);
+    assert_eq!(patched["inventory"]["components_with_gaps"], 0);
+    assert_eq!(patched["inventory"]["gaps"], json!([]));
+}
+
+#[tokio::test]
 async fn pinned_models_reuse_component_reviews_across_uploads_and_offline_restarts() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("sbom.json");

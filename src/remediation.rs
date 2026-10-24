@@ -2,6 +2,32 @@ use crate::policy::{Action, Report};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
+pub(crate) fn inventory(policy: &Report) -> Value {
+    let components_with_gaps: BTreeSet<_> = policy
+        .inventory_gaps
+        .iter()
+        .map(|gap| gap.component_index)
+        .collect();
+    let gaps: Vec<_> = policy.inventory_gaps.iter().map(|gap| {
+        let mut detail = component_details(policy, gap.component_index);
+        let suggested_action = match (gap.reason, policy.components[gap.component_index].component.kind.as_deref()) {
+            (_, Some("operating-system")) => "Verify the distro/release from the final image's /etc/os-release and Dockerfile final stage. Preserve OS package PURLs and image provenance; do not fabricate an OS PURL.",
+            ("missing_purl", _) => "Recover the package identity from the deployed artifact, lockfile or scanner evidence and record its verified PURL.",
+            _ => "Recover the exact installed version from the deployed binary's build metadata, verified source release/commit or package database. Preserve the evidence; do not guess or copy an unrelated product version.",
+        };
+        detail["reason"] = json!(gap.reason);
+        detail["suggested_action"] = json!(suggested_action);
+        detail
+    }).collect();
+    json!({
+        "components": policy.components.len(),
+        "identity_complete": gaps.is_empty(),
+        "gap_count": gaps.len(),
+        "components_with_gaps": components_with_gaps.len(),
+        "gaps": gaps,
+    })
+}
+
 pub(crate) fn report(policy: &Report) -> Value {
     let mut blockers = Vec::new();
     for rule in &policy.active_rules {
@@ -57,14 +83,13 @@ pub(crate) fn report(policy: &Report) -> Value {
         "scope": "whole_upstream",
         "summary": {"blocking_rules": blockers.len(), "blocking_cves": cves.len(), "inventory_gaps": policy.inventory_gaps.len()},
         "blockers": blockers,
-        "inventory_gaps": policy.inventory_gaps,
+        "inventory_gaps": inventory(policy)["gaps"],
         "ai_review": {"status": policy.ai.status, "cache": policy.ai.cache},
         "warning": "Read-only installed-policy report; no AI, advisory, leaderboard or refresh calls. Fixed versions are cached AI suggestions, not independently verified upgrade guarantees. Source/image attribution is supplied by the SBOM, not inferred. Inventory gaps do not block traffic. No active rules does not establish vulnerability-free software.",
     })
 }
 
 fn affected_component(policy: &Report, index: usize, cves: &[&str]) -> Value {
-    let component = &policy.components[index].component;
     let recommendations: Vec<_> = policy.ai.discoveries.iter()
         .filter(|finding| finding.component_index == index && cves.contains(&finding.cve.as_str()))
         .map(|finding| json!({
@@ -72,9 +97,16 @@ fn affected_component(policy: &Report, index: usize, cves: &[&str]) -> Value {
             "suggested_fixed_version": if finding.fixed_version.is_empty() { None } else { Some(&finding.fixed_version) },
             "source": finding.source,
         })).collect();
+    let mut component = component_details(policy, index);
+    component["recommendations"] = json!(recommendations);
+    component
+}
+
+fn component_details(policy: &Report, index: usize) -> Value {
+    let component = &policy.components[index].component;
     json!({
         "component_index": index, "name": component.name, "package": component.package,
+        "component_type": component.kind,
         "installed_version": component.version, "sources": component.sources,
-        "recommendations": recommendations,
     })
 }

@@ -268,7 +268,7 @@ async fn refresh(State(state): State<Arc<AppState>>) -> Response {
         return error(StatusCode::CONFLICT, "sbom-required");
     }
     match tokio::spawn(reanalyze(state, guard, ai::ReviewTrigger::Refresh)).await {
-        Ok(Ok(policy)) => Json(json!({"ready":true,"policy":policy.report})).into_response(),
+        Ok(Ok(policy)) => Json(json!({"ready":true,"inventory":remediation::inventory(&policy.report),"policy":policy.report})).into_response(),
         _ => error(StatusCode::INTERNAL_SERVER_ERROR, "refresh-failed"),
     }
 }
@@ -357,6 +357,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Response {
     let policy = state.policy.load_full();
     Json(json!({
         "ready": policy.is_some(),
+        "inventory": policy.as_ref().map(|p| remediation::inventory(&p.report)),
         "policy": policy.as_ref().map(|p| &p.report),
         "limits": {"body_bytes": state.config.max_body_bytes, "timeout_secs": state.config.timeout_secs, "max_in_flight": state.config.max_in_flight},
         "counters": {
@@ -455,7 +456,7 @@ async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Respons
     };
     let result = tokio::spawn(install(state, bytes, update_guard)).await;
     match result {
-        Ok(Ok(policy)) => Json(json!({"ready": true, "policy": policy.report})).into_response(),
+        Ok(Ok(policy)) => Json(json!({"ready": true, "inventory": remediation::inventory(&policy.report), "policy": policy.report})).into_response(),
         Ok(Err(error)) => {
             let status = if error.downcast_ref::<std::io::Error>().is_some()
                 || error.downcast_ref::<tempfile::PersistError>().is_some()

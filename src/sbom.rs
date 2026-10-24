@@ -12,7 +12,9 @@ pub struct Component {
     pub name: String,
     pub package: Option<String>,
     pub version: Option<String>,
-    // Display-only provenance must not change AI inputs or existing cache/snapshot identities.
+    // Display metadata must not change AI inputs or existing cache/snapshot identities.
+    #[serde(skip)]
+    pub kind: Option<String>,
     #[serde(skip)]
     pub sources: Vec<Source>,
 }
@@ -124,6 +126,7 @@ fn component(name: String, purl: Option<&str>, mut version: Option<String>) -> R
             name,
             package: None,
             version,
+            kind: None,
             sources: Vec::new(),
         });
     };
@@ -141,6 +144,7 @@ fn component(name: String, purl: Option<&str>, mut version: Option<String>) -> R
         name,
         package: Some(package),
         version: version.or(purl_version),
+        kind: None,
         sources: Vec::new(),
     })
 }
@@ -154,6 +158,7 @@ fn flatten_cdx(
         ensure!(output.len() < MAX_COMPONENTS, "too many components");
         if item.kind.as_deref() != Some("file") {
             let mut component = component(item.name, item.purl.as_deref(), item.version)?;
+            component.kind = item.kind;
             let names: std::collections::BTreeSet<_> = item
                 .properties
                 .iter()
@@ -258,7 +263,7 @@ mod tests {
         let document = serde_json::json!({
             "bomFormat":"CycloneDX", "specVersion":"1.6",
             "metadata":{"properties":[{"name":"filtr:inventory:provenance","value":metadata}]},
-            "components":[{"name":"a","purl":"pkg:npm/a@1.0.0","properties":[
+            "components":[{"type":"library","name":"a","purl":"pkg:npm/a@1.0.0","properties":[
                 {"name":"filtr:inventory:source","value":"app"},
                 {"name":"filtr:inventory:source","value":"other"},
                 {"name":"filtr:inventory:source","value":"app"}
@@ -266,6 +271,7 @@ mod tests {
         });
         let parsed = super::parse(&serde_json::to_vec(&document).unwrap()).unwrap();
         assert_eq!(parsed[0].sources.len(), 2);
+        assert_eq!(parsed[0].kind.as_deref(), Some("library"));
         assert_eq!(parsed[0].sources[0].image.as_deref(), Some("example/app:1"));
         assert!(parsed[0].sources[1].image.is_none());
         let plain =
