@@ -1,0 +1,27 @@
+{
+  "spdxVersion": "SPDX-2.3",
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "dataLicense": "CC0-1.0",
+  "name": "filtr-demo",
+  "documentNamespace": "https://example.invalid/spdx/filtr-demo-2026-10-24",
+  "creationInfo": {
+    "creators": ["Tool: Filtr-example"],
+    "created": "2026-10-24T00:00:00Z"
+  },
+  "packages": [
+    {
+      "SPDXID": "SPDXRef-Log4jCore",
+      "name": "log4j-core",
+      "versionInfo": "2.14.1",
+      "downloadLocation": "NOASSERTION",
+      "filesAnalyzed": false,
+      "externalRefs": [
+        {
+          "referenceCategory": "PACKAGE-MANAGER",
+          "referenceType": "purl",
+          "referenceLocator": "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+**
+!Cargo.toml
+!Cargo.lock
+!src/
+!src/**
+!rules/
+!rules/**
+!examples/
+!examples/upstream.rs
+!deploy/
+!deploy/probe.sh
+!Dockerfile

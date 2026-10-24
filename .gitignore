@@ -1,0 +1,10 @@
+/target/
+/data/
+.env
+.env.*
+!.env.example
+.secrets/
+*.ripwirecache
+.ripwire_quality_baseline
+.ripwire_quality_acks
+.DS_Store

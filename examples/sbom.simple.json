@@ -1,0 +1,6 @@
+{
+  "format": "filtr-1",
+  "packages": [
+    {"purl": "pkg:npm/react-server-dom-webpack@19.1.0"}
+  ]
+}

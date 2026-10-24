@@ -1,0 +1,32 @@
+name: filtr-local
+services:
+  origin:
+    build:
+      context: .
+      target: demo
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+  filtr:
+    build:
+      context: .
+      target: runtime
+    env_file: .env
+    environment:
+      FILTR_UPSTREAM: http://origin:3000
+      FILTR_LISTEN: 0.0.0.0:8080
+      FILTR_ADMIN_LISTEN: 127.0.0.1:9090
+      FILTR_SBOM: /data/sbom.json
+    ports:
+      - "127.0.0.1:${FILTR_PUBLIC_PORT:-8080}:8080"
+    volumes:
+      - filtr-data:/data
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on: [origin]
+    stop_grace_period: 30s
+    healthcheck:
+      start_period: 1560s
+volumes:
+  filtr-data:

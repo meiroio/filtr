@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "log4shell-lookups",
+      "cve": "CVE-2021-44228",
+      "packages": ["pkg:maven/org.apache.logging.log4j/log4j-core"],
+      "affected": [">=2.0.0, <2.3.1", ">=2.4.0, <2.12.2", ">=2.13.0, <2.15.0"],
+      "action": {"type": "tokens", "patterns": ["${"]},
+      "description": "Reject all lookup expressions in request targets, headers and bodies. This deliberately blocks legitimate interpolation too; application-specific decoding may still evade token inspection.",
+      "source": "https://logging.apache.org/security.html#CVE-2021-44228"
+    },
+    {
+      "id": "rsc-emergency-read-only",
+      "cve": "CVE-2025-55182",
+      "packages": ["pkg:npm/react-server-dom-webpack", "pkg:npm/react-server-dom-parcel", "pkg:npm/react-server-dom-turbopack"],
+      "affected": ["=19.0.0", "=19.1.0", "=19.1.1", "=19.2.0"],
+      "action": {"type": "deny_write"},
+      "description": "Allow only GET and HEAD while an affected RSC package is installed. All writes, Server Actions and OPTIONS are blocked. This is a conservative HTTP-method restriction, not a complete RSC protocol validator.",
+      "source": "https://react.dev/blog/2025/12/03/critical-security-vulnerability-in-react-server-components"
+    }
+  ]
+}
