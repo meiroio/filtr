@@ -385,6 +385,7 @@ mod tests {
                 name: "log4j".into(),
                 package: Some("pkg:maven/org.apache.logging.log4j/log4j-core".into()),
                 version: Some(version.into()),
+                sources: Vec::new(),
             }],
             &Catalog::bundled().unwrap(),
         )
@@ -449,6 +450,7 @@ mod tests {
                     name: "RSC".into(),
                     package: Some("pkg:npm/react-server-dom-webpack".into()),
                     version: Some(version.into()),
+                    sources: Vec::new(),
                 }],
                 &Catalog::bundled().unwrap(),
             )
@@ -467,6 +469,7 @@ mod tests {
                 name: "example".into(),
                 package: Some("pkg:npm/example".into()),
                 version: None,
+                sources: Vec::new(),
             }],
             &catalog,
         )

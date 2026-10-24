@@ -12,6 +12,23 @@ pub struct Component {
     pub name: String,
     pub package: Option<String>,
     pub version: Option<String>,
+    // Display-only provenance must not change AI inputs or existing cache/snapshot identities.
+    #[serde(skip)]
+    pub sources: Vec<Source>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Source {
+    pub name: String,
+    pub image: Option<String>,
+    pub image_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Property {
+    name: String,
+    #[serde(default)]
+    value: String,
 }
 
 #[derive(Deserialize)]
@@ -23,11 +40,25 @@ struct CdxComponent {
     purl: Option<String>,
     #[serde(default)]
     components: Vec<CdxComponent>,
+    #[serde(default)]
+    properties: Vec<Property>,
 }
 
 #[derive(Deserialize)]
 struct CdxMetadata {
     component: Option<CdxComponent>,
+    #[serde(default)]
+    properties: Vec<Property>,
+}
+
+impl CdxMetadata {
+    fn images(&self) -> Vec<Source> {
+        self.properties
+            .iter()
+            .find(|property| property.name == "filtr:inventory:provenance")
+            .and_then(|property| serde_json::from_str(&property.value).ok())
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Deserialize)]
@@ -93,6 +124,7 @@ fn component(name: String, purl: Option<&str>, mut version: Option<String>) -> R
             name,
             package: None,
             version,
+            sources: Vec::new(),
         });
     };
     let (package, purl_version) = package_identity(purl)?;
@@ -109,16 +141,42 @@ fn component(name: String, purl: Option<&str>, mut version: Option<String>) -> R
         name,
         package: Some(package),
         version: version.or(purl_version),
+        sources: Vec::new(),
     })
 }
 
-fn flatten_cdx(items: Vec<CdxComponent>, output: &mut Vec<Component>) -> Result<()> {
+fn flatten_cdx(
+    items: Vec<CdxComponent>,
+    output: &mut Vec<Component>,
+    images: &[Source],
+) -> Result<()> {
     for item in items {
         ensure!(output.len() < MAX_COMPONENTS, "too many components");
         if item.kind.as_deref() != Some("file") {
-            output.push(component(item.name, item.purl.as_deref(), item.version)?);
+            let mut component = component(item.name, item.purl.as_deref(), item.version)?;
+            let names: std::collections::BTreeSet<_> = item
+                .properties
+                .iter()
+                .filter(|p| p.name == "filtr:inventory:source" && !p.value.trim().is_empty())
+                .map(|p| &p.value)
+                .collect();
+            component.sources = names
+                .into_iter()
+                .map(|name| {
+                    images
+                        .iter()
+                        .find(|image| &image.name == name)
+                        .cloned()
+                        .unwrap_or_else(|| Source {
+                            name: name.clone(),
+                            image: None,
+                            image_id: None,
+                        })
+                })
+                .collect();
+            output.push(component);
         }
-        flatten_cdx(item.components, output)?;
+        flatten_cdx(item.components, output, images)?;
     }
     Ok(())
 }
@@ -134,10 +192,15 @@ pub fn parse(bytes: &[u8]) -> Result<Vec<Component>> {
             ["1.4", "1.5", "1.6", "1.7"].contains(&document.spec_version.as_str()),
             "supported CycloneDX versions: 1.4–1.7"
         );
+        let images = document
+            .metadata
+            .as_ref()
+            .map(CdxMetadata::images)
+            .unwrap_or_default();
         if let Some(item) = document.metadata.and_then(|m| m.component) {
-            flatten_cdx(vec![item], &mut output)?;
+            flatten_cdx(vec![item], &mut output, &images)?;
         }
-        flatten_cdx(document.components, &mut output)?;
+        flatten_cdx(document.components, &mut output, &images)?;
     } else if value.get("spdxVersion").is_some() {
         ensure!(
             matches!(value["spdxVersion"].as_str(), Some("SPDX-2.2" | "SPDX-2.3")),
@@ -186,6 +249,37 @@ pub fn parse(bytes: &[u8]) -> Result<Vec<Component>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn display_provenance_preserves_ai_identity_and_all_source_images() {
+        let metadata = serde_json::json!([
+            {"name":"app","image":"example/app:1","image_id":"sha256:example"}
+        ])
+        .to_string();
+        let document = serde_json::json!({
+            "bomFormat":"CycloneDX", "specVersion":"1.6",
+            "metadata":{"properties":[{"name":"filtr:inventory:provenance","value":metadata}]},
+            "components":[{"name":"a","purl":"pkg:npm/a@1.0.0","properties":[
+                {"name":"filtr:inventory:source","value":"app"},
+                {"name":"filtr:inventory:source","value":"other"},
+                {"name":"filtr:inventory:source","value":"app"}
+            ]}]
+        });
+        let parsed = super::parse(&serde_json::to_vec(&document).unwrap()).unwrap();
+        assert_eq!(parsed[0].sources.len(), 2);
+        assert_eq!(parsed[0].sources[0].image.as_deref(), Some("example/app:1"));
+        assert!(parsed[0].sources[1].image.is_none());
+        let plain =
+            super::parse(br#"{"format":"filtr-1","packages":[{"purl":"pkg:npm/a@1.0.0"}]}"#)
+                .unwrap();
+        // Simple input uses the PURL as its display name; compare the same inventory fields.
+        let mut plain = plain;
+        plain[0].name = "a".into();
+        assert_eq!(
+            serde_json::to_value(&parsed).unwrap(),
+            serde_json::to_value(&plain).unwrap()
+        );
+    }
+
     #[test]
     fn accepts_equivalent_go_stdlib_versions_and_explicit_rpm_epochs() {
         let bytes = br#"{"bomFormat":"CycloneDX","specVersion":"1.6","components":[{"name":"stdlib","version":"go1.26.2","purl":"pkg:golang/stdlib@1.26.2"},{"name":"findutils","version":"1:4.8.0-7.el9","purl":"pkg:rpm/redhat/findutils@4.8.0-7.el9?epoch=1&distro=rhel-9.7"}]}"#;

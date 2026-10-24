@@ -3,7 +3,7 @@ name = "filtr"
 version = "0.1.0"
 edition = "2024"
 description = "An SBOM-aware HTTP firewall reverse proxy"
-license = "MIT"
+license = "PolyForm-Noncommercial-1.0.0"
 
 [dependencies]
 aho-corasick = "1.1"

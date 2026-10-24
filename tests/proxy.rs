@@ -236,7 +236,7 @@ async fn requires_sbom_and_authenticates_separate_admin_plane() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(app.hits.load(Ordering::SeqCst), 0);
-    for endpoint in ["/livez", "/healthz", "/v1/status"] {
+    for endpoint in ["/livez", "/healthz", "/v1/status", "/v1/remediation"] {
         for token in [None, Some("wrong-token")] {
             let mut request = app.client.get(format!("{}{endpoint}", app.admin));
             if let Some(token) = token {
@@ -263,6 +263,7 @@ async fn readiness_requires_an_sbom_but_liveness_does_not() {
     for (endpoint, expected) in [
         ("/livez", StatusCode::OK),
         ("/healthz", StatusCode::SERVICE_UNAVAILABLE),
+        ("/v1/remediation", StatusCode::SERVICE_UNAVAILABLE),
     ] {
         assert_eq!(
             app.client
@@ -1863,4 +1864,95 @@ async fn explicit_refresh_clears_cache_without_provider_credentials() {
         app.status().await["policy"]["ai"]["status"],
         "not_configured"
     );
+}
+
+#[tokio::test]
+async fn remediation_tracks_static_rules_and_clears_after_replacement() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = Harness::start(&directory.path().join("sbom.json")).await;
+    assert_eq!(app.upload(VULNERABLE).await.status(), StatusCode::OK);
+    let report: Value = serde_json::from_slice(
+        &app.client
+            .get(format!("{}/v1/remediation", app.admin))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(report["quarantined"], false);
+    assert_eq!(report["blockers"][0]["origin"], "static");
+    assert_eq!(report["blockers"][0]["cves"][0], "CVE-2021-44228");
+    assert_eq!(
+        report["blockers"][0]["affected_components"][0]["recommendations"],
+        json!([])
+    );
+    assert_eq!(app.upload(PATCHED).await.status(), StatusCode::OK);
+    let report: Value = serde_json::from_slice(
+        &app.client
+            .get(format!("{}/v1/remediation", app.admin))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(report["blockers"], json!([]));
+}
+
+#[tokio::test]
+async fn remediation_reads_cached_findings_without_provider_calls() {
+    let directory = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let ai = Router::new().route(
+        "/v1/responses",
+        post(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async { Json(discovery_reply()) }
+        }),
+    );
+    let config = filtr::ai::AiConfig {
+        api_key: Some("test-key".into()),
+        model: Some("openai/test-model".into()),
+        ..Default::default()
+    };
+    let app =
+        Harness::start_configured(&directory.path().join("sbom.json"), Some(ai), config).await;
+    let inventory = r#"{"bomFormat":"CycloneDX","specVersion":"1.6","components":[{"name":"a","purl":"pkg:npm/a@1.0.0","properties":[{"name":"filtr:inventory:source","value":"api"}]}]}"#;
+    assert_eq!(app.upload(inventory).await.status(), StatusCode::OK);
+    assert_eq!(app.upload(inventory).await.status(), StatusCode::OK);
+    for _ in 0..2 {
+        let response = app
+            .client
+            .get(format!("{}/v1/remediation", app.admin))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let remediation: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+        assert_eq!(remediation["quarantined"], true);
+        assert_eq!(remediation["summary"]["blocking_rules"], 1);
+        let component = &remediation["blockers"][0]["affected_components"][0];
+        assert_eq!(component["component_index"], 0);
+        assert_eq!(component["package"], "pkg:npm/a");
+        assert_eq!(component["sources"][0]["name"], "api");
+        assert_eq!(remediation["ai_review"]["cache"]["hits"], 1);
+        assert_eq!(
+            component["recommendations"][0]["suggested_fixed_version"],
+            "1.0.1.RELEASE"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "report reads must not call AI"
+        );
+    }
 }

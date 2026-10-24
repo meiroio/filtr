@@ -5,6 +5,7 @@ pub mod generated;
 mod network;
 pub mod policy;
 mod proxy;
+mod remediation;
 pub mod sbom;
 
 use anyhow::{Context, Result, ensure};
@@ -269,6 +270,7 @@ pub fn routers(state: Arc<AppState>) -> (Router, Router) {
         .route("/healthz", get(health))
         .route("/v1/status", get(status))
         .route("/v1/rules", get(rules))
+        .route("/v1/remediation", get(remediation))
         .route("/v1/sbom", post(upload))
         .route("/v1/refresh", post(refresh))
         .layer(middleware::from_fn_with_state(state.clone(), admin_gate))
@@ -356,6 +358,13 @@ async fn status(State(state): State<Arc<AppState>>) -> Response {
 async fn rules(State(state): State<Arc<AppState>>) -> Response {
     let policy = state.policy.load_full();
     Json(json!({"version": 1, "rules": state.catalog.specs(), "generated_rules": policy.as_ref().map(|p| &p.report.generated_rules), "ai": policy.as_ref().map(|p| &p.report.ai)})).into_response()
+}
+
+async fn remediation(State(state): State<Arc<AppState>>) -> Response {
+    let Some(policy) = state.policy.load_full() else {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "sbom-required");
+    };
+    Json(remediation::report(&policy.report)).into_response()
 }
 
 fn persist(path: &Path, bytes: &[u8]) -> Result<()> {

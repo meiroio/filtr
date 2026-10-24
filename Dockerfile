@@ -22,6 +22,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
     && install -d -o 10001 -g 10001 /data
+COPY LICENSE /usr/share/licenses/filtr/LICENSE
+LABEL org.opencontainers.image.licenses="PolyForm-Noncommercial-1.0.0"
 USER 10001:10001
 WORKDIR /data
 
