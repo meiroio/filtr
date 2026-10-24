@@ -51,6 +51,8 @@ spec:
             - name: FILTR_AI_CACHE_TTL_SECS
               value: "86400"
             # Optionally add FILTR_AI_MODEL here to pin a native provider model.
+            # Optional SRE notifications: add FILTR_WEBHOOK_URL and
+            # FILTR_WEBHOOK_TIMEOUT_SECS; load FILTR_WEBHOOK_TOKEN from a Secret.
             - name: FILTR_ADMIN_TOKEN
               valueFrom:
                 secretKeyRef:

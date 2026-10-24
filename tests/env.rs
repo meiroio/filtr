@@ -51,6 +51,28 @@ fn malformed_dotenv_errors_never_expose_its_contents() {
 }
 
 #[test]
+fn help_hides_webhook_credentials_and_private_url() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = command(directory.path())
+        .env(
+            "FILTR_WEBHOOK_URL",
+            "https://private.example/hooks/secret-path",
+        )
+        .env("FILTR_WEBHOOK_TOKEN", "private-receiver-token")
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8_lossy(&output.stdout);
+    for variable in ["FILTR_WEBHOOK_URL", "FILTR_WEBHOOK_TOKEN"] {
+        assert!(help.contains(variable));
+    }
+    for secret in ["private.example", "secret-path", "private-receiver-token"] {
+        assert!(!help.contains(secret), "help exposed a private setting");
+    }
+}
+
+#[test]
 fn precedence_is_cli_then_process_environment_then_dotenv() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join(".env"), format!(

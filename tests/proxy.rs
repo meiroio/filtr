@@ -66,7 +66,16 @@ impl Harness {
     async fn start_configured(
         sbom: &Path,
         ai: Option<Router>,
+        ai_config: filtr::ai::AiConfig,
+    ) -> Self {
+        Self::start_configured_with_webhook(sbom, ai, ai_config, Default::default()).await
+    }
+
+    async fn start_configured_with_webhook(
+        sbom: &Path,
+        ai: Option<Router>,
         mut ai_config: filtr::ai::AiConfig,
+        webhook: filtr::webhook::Config,
     ) -> Self {
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let public_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -103,6 +112,7 @@ impl Harness {
             sbom: sbom.into(),
             rules: None,
             ai: ai_config,
+            webhook,
             max_body_bytes: 1024,
             timeout_secs: 1,
             max_in_flight: 4,
@@ -1105,6 +1115,7 @@ async fn anthropic_refusals_and_truncation_keep_static_mappings_without_openai()
 #[tokio::test]
 async fn generated_quarantine_blocks_every_method_and_clears_after_patching() {
     let directory = tempfile::tempdir().unwrap();
+    let (webhook_url, mut events, webhook_task) = recording_webhook(StatusCode::NO_CONTENT).await;
     let ai = Router::new().route(
         "/v1/responses",
         post(|Json(request): Json<Value>| async move {
@@ -1117,7 +1128,20 @@ async fn generated_quarantine_blocks_every_method_and_clears_after_patching() {
             })
         }),
     );
-    let app = Harness::start_with_services(&directory.path().join("sbom.json"), Some(ai)).await;
+    let app = Harness::start_configured_with_webhook(
+        &directory.path().join("sbom.json"),
+        Some(ai.route("/leaderboard", get(|| async { Json(test_leaderboard()) }))),
+        filtr::ai::AiConfig {
+            cache_ttl_secs: 0,
+            api_key: Some("test-openai-key".into()),
+            ..Default::default()
+        },
+        filtr::webhook::Config {
+            webhook_url: Some(webhook_url),
+            ..Default::default()
+        },
+    )
+    .await;
     let vulnerable =
         r#"{"format":"filtr-1","packages":[{"purl":"pkg:maven/example/component@1.0.0.RELEASE"}]}"#;
     app.upload(vulnerable).await;
@@ -1126,6 +1150,12 @@ async fn generated_quarantine_blocks_every_method_and_clears_after_patching() {
     assert_eq!(generated["origin"], "ai_discovery");
     assert_eq!(generated["version"], "1.0.0.RELEASE");
     assert_eq!(generated["action"]["type"], "deny_all");
+    let (_, blocked, _) = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(blocked["remediation"]["quarantined"], true);
+    assert_eq!(blocked["remediation"]["ai_review"]["status"], "complete");
     for method in [
         reqwest::Method::GET,
         reqwest::Method::HEAD,
@@ -1146,10 +1176,18 @@ async fn generated_quarantine_blocks_every_method_and_clears_after_patching() {
     assert_eq!(app.hits.load(Ordering::SeqCst), 0);
     assert_eq!(app.upload(PATCHED).await.status(), StatusCode::OK);
     assert_eq!(app.status().await["policy"]["generated_rules"], json!([]));
+    let (_, restored, _) = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored["remediation"]["quarantined"], false);
+    assert_eq!(restored["remediation"]["ai_review"]["status"], "complete");
+    assert_eq!(restored["remediation"]["blockers"], json!([]));
     assert_eq!(
         app.client.get(&app.public).send().await.unwrap().status(),
         StatusCode::CREATED
     );
+    webhook_task.abort();
 }
 
 #[tokio::test]
@@ -1904,6 +1942,163 @@ async fn remediation_tracks_static_rules_and_clears_after_replacement() {
     )
     .unwrap();
     assert_eq!(report["blockers"], json!([]));
+}
+
+async fn recording_webhook(
+    status: StatusCode,
+) -> (
+    reqwest::Url,
+    tokio::sync::mpsc::UnboundedReceiver<(axum::http::HeaderMap, Value, String)>,
+    JoinHandle<()>,
+) {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/hooks/filtr", listener.local_addr().unwrap())
+        .parse()
+        .unwrap();
+    let router = Router::new().fallback(move |request: Request| {
+        let sender = sender.clone();
+        async move {
+            let (parts, body) = request.into_parts();
+            let body = to_bytes(body, 1024 * 1024).await.unwrap();
+            sender
+                .send((
+                    parts.headers,
+                    serde_json::from_slice(&body).unwrap_or(Value::Null),
+                    parts.uri.path().into(),
+                ))
+                .unwrap();
+            (status, [(header::LOCATION, "/must-not-follow")])
+        }
+    });
+    let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (url, receiver, task)
+}
+
+#[tokio::test]
+async fn webhooks_report_real_policy_changes_without_ai_or_duplicate_notifications() {
+    let directory = tempfile::tempdir().unwrap();
+    let (url, mut events, task) = recording_webhook(StatusCode::NO_CONTENT).await;
+    let app = Harness::start_configured_with_webhook(
+        &directory.path().join("sbom.json"),
+        None,
+        Default::default(),
+        filtr::webhook::Config {
+            webhook_url: Some(url.clone()),
+            webhook_token: Some("test-webhook-secret".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(app.upload(VULNERABLE).await.status(), StatusCode::OK);
+    let (headers, event, path) =
+        tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(path, "/hooks/filtr");
+    assert_eq!(headers[header::AUTHORIZATION], "Bearer test-webhook-secret");
+    assert_eq!(headers["x-filtr-event-id"], event["id"].as_str().unwrap());
+    assert_eq!(event["event"], "filtr.remediation_updated");
+    assert_eq!(event["trigger"], "sbom_update");
+    assert_eq!(
+        event["remediation"]["blockers"][0]["cves"][0],
+        "CVE-2021-44228"
+    );
+    assert_eq!(
+        event["remediation"]["ai_review"]["status"],
+        "not_configured"
+    );
+    let serialized = event.to_string();
+    assert!(!serialized.contains(TOKEN));
+    assert!(!serialized.contains("test-webhook-secret"));
+    assert_eq!(app.upload(VULNERABLE).await.status(), StatusCode::OK);
+    let _ = app.status().await;
+    assert_eq!(app.upload(PATCHED).await.status(), StatusCode::OK);
+    let (_, cleared, _) = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cleared["remediation"]["blockers"], json!([]));
+    assert_ne!(event["id"], cleared["id"]);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), events.recv())
+            .await
+            .is_err()
+    );
+    drop(app);
+    let restarted = Harness::start_configured_with_webhook(
+        &directory.path().join("sbom.json"),
+        None,
+        Default::default(),
+        filtr::webhook::Config {
+            webhook_url: Some(url),
+            ..Default::default()
+        },
+    )
+    .await;
+    let (headers, event, _) =
+        tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(!headers.contains_key(header::AUTHORIZATION));
+    assert_eq!(event["trigger"], "startup");
+    assert_eq!(event["remediation"]["blockers"], json!([]));
+    assert_eq!(
+        restarted.status().await["policy"]["ai"]["attempts"],
+        json!([])
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn webhook_retries_preserve_id_without_following_redirects_or_delaying_uploads() {
+    let directory = tempfile::tempdir().unwrap();
+    let (url, mut events, task) = recording_webhook(StatusCode::TEMPORARY_REDIRECT).await;
+    let app = Harness::start_configured_with_webhook(
+        &directory.path().join("sbom.json"),
+        None,
+        Default::default(),
+        filtr::webhook::Config {
+            webhook_url: Some(url),
+            webhook_token: Some("private-receiver-token".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let response = tokio::time::timeout(std::time::Duration::from_secs(1), app.upload(VULNERABLE))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut first = None;
+    for _ in 0..3 {
+        let (headers, event, path) =
+            tokio::time::timeout(std::time::Duration::from_secs(4), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(path, "/hooks/filtr");
+        assert_eq!(headers["x-filtr-event-id"], event["id"].as_str().unwrap());
+        if let Some(first) = &first {
+            assert_eq!(&event, first);
+        } else {
+            first = Some(event);
+        }
+    }
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), events.recv())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        app.status().await["policy"]["active_rules"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    task.abort();
 }
 
 #[tokio::test]

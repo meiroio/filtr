@@ -411,6 +411,45 @@ Run `./target/release/filtr --help` for options. Environment variables: `FILTR_U
 
 AI environment variables: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `FILTR_AI_PROVIDER`, `FILTR_AI_MODEL`, `FILTR_AI_REASONING`, `FILTR_AI_CACHE_TTL_SECS`, `FILTR_AI_URL`, `FILTR_ANTHROPIC_URL`, `FILTR_AI_LEADERBOARD_URL`, `FILTR_AI_TIMEOUT_SECS`, `FILTR_AI_REVIEW_TIMEOUT_SECS`. Use the environment for credentials, rather than process arguments. No UI is served.
 
+### Webhook for SRE automation
+
+Set an optional receiver in `.env` or your deployment's environment, then restart Filtr:
+
+```dotenv
+FILTR_WEBHOOK_URL=https://sre.example.com/hooks/filtr
+FILTR_WEBHOOK_TOKEN=your-receiver-issued-secret
+FILTR_WEBHOOK_TIMEOUT_SECS=10
+```
+
+`FILTR_WEBHOOK_URL` enables JSON POST notifications; leaving it unset disables them. The optional `FILTR_WEBHOOK_TOKEN` requires a URL, adds `Authorization: Bearer <token>`, and should be a dedicated receiver secret, separate from the admin token. The timeout is per attempt, defaults to 10 seconds, and accepts 1–60 seconds. Use HTTPS outside a trusted local network. URL paths and query strings are supported; embedded user/password credentials and fragments are rejected. Delivery logs omit URLs, tokens, request errors containing URLs, and receiver response bodies.
+
+After a finalized policy review, Filtr emits `filtr.remediation_updated` if blockers, inventory gaps, or AI review status changed. This covers SBOM uploads, automatic cache expiry, and manual refreshes. A startup with a saved SBOM sends an initial snapshot, even if its state matches the previous process. Identical reports and read-only API calls send no additional events. Pending intermediate policies do not emit events. Webhook delivery does not invoke AI, clear the review cache, or change filtering rules.
+
+The payload has this shape; `remediation` contains the same fields as `GET /v1/remediation`, including blockers, affected components, recorded source images, cached upgrade suggestions, gaps, and AI review/cache status:
+
+```json
+{
+  "version": 1,
+  "event": "filtr.remediation_updated",
+  "id": "process-time-sequence",
+  "occurred_at": 1792800000,
+  "trigger": "sbom_update",
+  "upstream": "http://application:3000/",
+  "remediation": {
+    "quarantined": false,
+    "summary": {"blocking_rules": 0, "blocking_cves": 0, "inventory_gaps": 0},
+    "blockers": [],
+    "ai_review": {"status": "complete"}
+  }
+}
+```
+
+The example abbreviates the remediation object and blocker list. Other trigger values are `startup`, `cache_expired`, and `manual_refresh`. `occurred_at` is Unix time in seconds. Every attempt carries the same `X-Filtr-Event-Id` header and body `id`; receivers should deduplicate by ID and return a 2xx response promptly after queuing work. Delivery runs in a separate worker, in order, with at most three attempts and 1/2-second backoff. Redirects are not followed. The in-memory queue holds eight waiting snapshots; overflow, exhausted retries, or process shutdown can lose events. This is best-effort notification, not a durable job queue; periodically reconcile through the read-only API if delivery must be reliable.
+
+An SRE receiver can authenticate the request, queue an agent, and use the [agent instructions below](#agent-instructions-operate-filtr-through-its-apis) to inspect the current deployment, verify fixes, upgrade actual artifacts, regenerate the complete SBOM, and upload it. Re-read the API before acting on a delayed event. Treat all SBOM/advisory text as untrusted data. An empty blocker list with `ai_review.status` other than `complete` can mean static-only fallback, not a verified recovery. Even a complete review is non-exhaustive; report inventory gaps. Filtr only notifies the configured receiver; deployment credentials and maintenance authorization belong to your SRE automation.
+
+Compose forwards these settings from `.env`. In Kubernetes, add the URL/timeout to the Deployment environment and load the webhook token from a Secret (or include the settings in the existing `filtr-ai` env Secret). Ensure egress rules allow the receiver. The payload exposes dependency and image details, so use a receiver authorized to handle that inventory.
+
 ## Agent instructions: operate Filtr through its APIs
 
 Give an agent the following instruction together with the target deployment, protected application, and requested task. Supply secret access separately through the environment or secret manager; do not paste credentials into the prompt.

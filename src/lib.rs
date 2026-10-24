@@ -7,6 +7,7 @@ pub mod policy;
 mod proxy;
 mod remediation;
 pub mod sbom;
+pub mod webhook;
 
 use anyhow::{Context, Result, ensure};
 use arc_swap::ArcSwapOption;
@@ -58,6 +59,8 @@ pub struct Config {
     pub rules: Option<PathBuf>,
     #[command(flatten)]
     pub ai: ai::AiConfig,
+    #[command(flatten)]
+    pub webhook: webhook::Config,
     #[arg(long, default_value_t = 1_048_576)]
     pub max_body_bytes: usize,
     #[arg(long, default_value_t = 10)]
@@ -69,6 +72,7 @@ pub struct Config {
 impl Config {
     pub fn validate(&self) -> Result<()> {
         self.ai.validate()?;
+        self.webhook.validate()?;
         ensure!(
             self.admin_listen.ip().is_loopback(),
             "admin listener must use a loopback address"
@@ -136,6 +140,7 @@ pub struct AppState {
     policy: ArcSwapOption<Policy>,
     client: reqwest::Client,
     ai: ai::Client,
+    webhook: Option<webhook::Notifier>,
     counters: Counters,
     requests: Arc<Semaphore>,
     admin_requests: Arc<Semaphore>,
@@ -159,6 +164,7 @@ impl AppState {
             None => Catalog::bundled()?,
         };
         let ai = ai::Client::new(config.ai.clone(), &config.sbom)?;
+        let webhook = webhook::Notifier::new(&config.webhook, &config.upstream)?;
         let policy = match read_bounded(&config.sbom) {
             Ok(bytes) => {
                 let mut policy = Policy::compile(sbom::parse(&bytes)?, &catalog)?;
@@ -189,10 +195,14 @@ impl AppState {
             catalog,
             client,
             ai,
+            webhook,
             policy: ArcSwapOption::from(policy),
             counters: Counters::default(),
             updates: Arc::new(Mutex::new(())),
         });
+        if let (Some(notifier), Some(policy)) = (&state.webhook, state.policy.load_full()) {
+            notifier.notify(&policy.report, ai::ReviewTrigger::Startup);
+        }
         schedule_refresh(&state);
         Ok(state)
     }
@@ -244,6 +254,9 @@ async fn reanalyze(
     state.ai.enhance(&mut policy, trigger).await;
     let policy = Arc::new(policy);
     state.policy.store(Some(policy.clone()));
+    if let Some(notifier) = &state.webhook {
+        notifier.notify(&policy.report, trigger);
+    }
     Ok(policy)
 }
 
@@ -409,6 +422,9 @@ async fn install(
         .await;
     let policy = Arc::new(policy);
     state.policy.store(Some(policy.clone()));
+    if let Some(notifier) = &state.webhook {
+        notifier.notify(&policy.report, ai::ReviewTrigger::SbomUpdate);
+    }
     Ok(policy)
 }
 
