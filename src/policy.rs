@@ -129,8 +129,8 @@ pub struct Coverage {
 #[derive(Clone, Serialize)]
 pub struct Report {
     pub components: Vec<Coverage>,
+    pub inventory_gaps: Vec<crate::ai::research::InventoryGap>,
     pub active_rules: Vec<RuleSpec>,
-    pub osv: crate::osv::ScanReport,
     pub generated_rules: Vec<crate::generated::Rule>,
     pub ai: crate::ai::Review,
     pub warning: &'static str,
@@ -205,12 +205,12 @@ impl Policy {
             .collect();
         let mut policy = Self {
             report: Report {
+                inventory_gaps: crate::ai::research::inventory_gaps(&coverage),
                 components: coverage,
                 active_rules,
-                osv: crate::osv::ScanReport::default(),
                 generated_rules: Vec::new(),
                 ai: crate::ai::Review::default(),
-                warning: "Static mappings remain active while AI is missing, pending or failed. Generated restrictions activate only after a successful AI review and can quarantine this entire upstream. Uncovered findings and failed/skipped lookups remain unmitigated or unknown; payload rules do not prove protection.",
+                warning: "Static mappings remain active while AI is missing, pending or failed. Generated restrictions activate only after a successful AI review and can quarantine this entire upstream. Vulnerability discovery is AI-assessed and non-exhaustive. Missing identities or versions and unreported CVEs remain unknown; payload rules do not prove protection.",
             },
             matcher: None,
             token_rules: Vec::new(),
@@ -233,7 +233,6 @@ impl Policy {
             candidate.report.generated_rules.push(rule);
         }
         candidate.rebuild_matcher()?;
-        crate::generated::refresh_coverage(&mut candidate.report);
         *self = candidate;
         Ok(())
     }

@@ -9,6 +9,7 @@ pub(super) const LEADERBOARD_URL: &str =
     "https://vercel.com/ai-gateway/leaderboards/deepsecbench/results.json";
 pub(super) const BACKUP_MODEL: &str = "gpt-5.6-luna";
 
+#[derive(Clone, Deserialize, Serialize)]
 pub(super) struct Target {
     pub provider: Provider,
     pub model: String,
@@ -46,6 +47,54 @@ struct Snapshot {
     leaderboard: Leaderboard,
 }
 
+pub(super) fn override_target(config: &AiConfig) -> Result<Option<Target>> {
+    let Some(value) = &config.model else {
+        return Ok(None);
+    };
+    let (provider, model) = match value.split_once('/') {
+        Some(("openai", model)) => (Provider::Openai, model),
+        Some(("anthropic", model)) => (Provider::Anthropic, model),
+        Some(_) => anyhow::bail!("AI model prefix must be openai/ or anthropic/"),
+        None => {
+            let provider = config
+                .provider
+                .or_else(
+                    || match (config.api_key.is_some(), config.anthropic_api_key.is_some()) {
+                        (true, false) => Some(Provider::Openai),
+                        (false, true) => Some(Provider::Anthropic),
+                        _ => None,
+                    },
+                )
+                .context(
+                    "a bare AI model requires FILTR_AI_PROVIDER when the provider is ambiguous",
+                )?;
+            (provider, value.as_str())
+        }
+    };
+    ensure!(
+        config.provider.is_none_or(|chosen| chosen == provider),
+        "AI model prefix conflicts with configured provider"
+    );
+    ensure!(
+        config.key(provider).is_some(),
+        "the overridden model's provider has no API key"
+    );
+    ensure!(
+        !model.is_empty()
+            && model.len() <= 200
+            && model
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)),
+        "invalid AI model ID"
+    );
+    Ok(Some(Target {
+        provider,
+        model: model.to_owned(),
+        reasoning: config.reasoning.clone().unwrap_or_else(|| "default".into()),
+        rank: None,
+    }))
+}
+
 pub(super) async fn select(
     http: &reqwest::Client,
     config: &AiConfig,
@@ -53,6 +102,9 @@ pub(super) async fn select(
     path: &Path,
     trigger: ReviewTrigger,
 ) -> Result<Target> {
+    if let Some(target) = override_target(config)? {
+        return Ok(target);
+    }
     let inventory = serde_json::to_value(&report.components)?;
     if matches!(trigger, ReviewTrigger::SbomUpdate) {
         return refresh(http, config, inventory, path).await;
@@ -87,7 +139,7 @@ async fn refresh(
         .send()
         .await
         .map_err(|_| anyhow::anyhow!("leaderboard request failed or timed out"))?;
-    let board: Leaderboard = crate::osv::read_json(response, 256 * 1024, "Leaderboard").await?;
+    let board: Leaderboard = crate::network::read_json(response, 256 * 1024, "Leaderboard").await?;
     let target = choose(&board, config)?;
     let snapshot = serde_json::to_vec(&Snapshot {
         inventory,
@@ -147,7 +199,10 @@ fn choose(board: &Leaderboard, config: &AiConfig) -> Result<Target> {
         } else {
             model.into()
         },
-        reasoning: entry.reasoning.clone(),
+        reasoning: config
+            .reasoning
+            .clone()
+            .unwrap_or_else(|| entry.reasoning.clone()),
         rank: Some(entry.rank),
     })
 }
@@ -158,6 +213,41 @@ mod tests {
 
     fn board(entries: serde_json::Value) -> Leaderboard {
         serde_json::from_value(serde_json::json!({"results": entries})).unwrap()
+    }
+
+    #[test]
+    fn overrides_require_unambiguous_valid_provider_models() {
+        let mut config = AiConfig {
+            api_key: Some("test-openai".into()),
+            anthropic_api_key: Some("test-anthropic".into()),
+            model: Some("budget-model".into()),
+            ..Default::default()
+        };
+        assert!(override_target(&config).is_err());
+        config.provider = Some(Provider::Anthropic);
+        assert_eq!(
+            override_target(&config).unwrap().unwrap().reasoning,
+            "default"
+        );
+        config.model = Some("openai/budget-model".into());
+        assert!(override_target(&config).is_err());
+        config.provider = None;
+        assert_eq!(
+            override_target(&config).unwrap().unwrap().provider,
+            Provider::Openai
+        );
+        for value in [
+            "openai/",
+            "other/model",
+            "openai/unsafe model",
+            "openai/model/path",
+        ] {
+            config.model = Some(value.into());
+            assert!(override_target(&config).is_err());
+        }
+        config.model = Some("anthropic/budget-model".into());
+        config.anthropic_api_key = None;
+        assert!(override_target(&config).is_err());
     }
 
     #[test]

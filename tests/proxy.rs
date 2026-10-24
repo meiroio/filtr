@@ -35,6 +35,7 @@ struct Harness {
     hits: Arc<AtomicUsize>,
     client: reqwest::Client,
     tasks: Vec<JoinHandle<()>>,
+    ai_config: filtr::ai::AiConfig,
 }
 
 impl Drop for Harness {
@@ -47,41 +48,30 @@ impl Drop for Harness {
 
 impl Harness {
     async fn start(sbom: &Path) -> Self {
-        Self::start_with_osv(sbom, Router::new().fallback(|| async { Json(json!({})) })).await
+        Self::start_with_services(sbom, None).await
     }
 
-    async fn start_with_osv(sbom: &Path, osv: Router) -> Self {
-        Self::start_with_services(sbom, osv, None).await
-    }
-
-    async fn start_with_services(sbom: &Path, osv: Router, ai: Option<Router>) -> Self {
+    async fn start_with_services(sbom: &Path, ai: Option<Router>) -> Self {
         let config = filtr::ai::AiConfig {
+            cache_ttl_secs: 0,
             api_key: ai.as_ref().map(|_| "test-openai-key".into()),
             ai_timeout_secs: 1,
             ..Default::default()
         };
         let ai = ai
             .map(|router| router.route("/leaderboard", get(|| async { Json(test_leaderboard()) })));
-        Self::start_configured(sbom, osv, ai, config).await
+        Self::start_configured(sbom, ai, config).await
     }
 
     async fn start_configured(
         sbom: &Path,
-        osv: Router,
         ai: Option<Router>,
         mut ai_config: filtr::ai::AiConfig,
     ) -> Self {
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let public_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let admin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let osv_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let osv_url = format!("http://{}", osv_listener.local_addr().unwrap())
-            .parse()
-            .unwrap();
-        let osv_task = tokio::spawn(async move {
-            axum::serve(osv_listener, osv).await.unwrap();
-        });
-        let mut service_tasks = vec![osv_task];
+        let mut service_tasks = Vec::new();
         if let Some(ai) = ai {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url: reqwest::Url = format!("http://{}", listener.local_addr().unwrap())
@@ -112,8 +102,6 @@ impl Harness {
             admin_token: TOKEN.into(),
             sbom: sbom.into(),
             rules: None,
-            osv_url,
-            osv_timeout_secs: 1,
             ai: ai_config,
             max_body_bytes: 1024,
             timeout_secs: 1,
@@ -122,6 +110,7 @@ impl Harness {
         let addr = config.listen;
         let public = format!("http://{}", config.listen);
         let admin = format!("http://{}", config.admin_listen);
+        let ai_config = config.ai.clone();
         let state = AppState::new(config).await.unwrap();
         let (proxy, administration) = routers(state);
         let mut tasks = vec![
@@ -153,6 +142,7 @@ impl Harness {
             hits,
             client,
             tasks,
+            ai_config,
         }
     }
 
@@ -449,6 +439,13 @@ async fn refuses_uninspectable_envelopes_and_bounds_body_size() {
         (
             app.client
                 .post(&app.public)
+                .header("content-encoding", "br")
+                .body("harmless Brotli envelope test"),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        ),
+        (
+            app.client
+                .post(&app.public)
                 .header("content-type", "text/plain; charset = utf-16")
                 .body("body"),
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -581,251 +578,6 @@ async fn bounds_concurrency_and_times_out_stalled_bodies() {
     );
 }
 
-#[tokio::test]
-async fn osv_reports_coverage_per_package_and_version() {
-    let directory = tempfile::tempdir().unwrap();
-    let calls = Arc::new(AtomicUsize::new(0));
-    let count = calls.clone();
-    let osv = Router::new().route("/v1/query", post(move |Json(query): Json<Value>| {
-        let count = count.clone();
-        async move {
-            count.fetch_add(1, Ordering::SeqCst);
-            let vulns = match query["package"]["purl"].as_str().unwrap() {
-                "pkg:maven/org.apache.logging.log4j/log4j-core" if query["version"] == "2.14.1" => json!([
-                    {"id":"GHSA-log4shell", "aliases":["CVE-2021-44228"], "summary":"Lookup vulnerability"},
-                    {"id":"CVE-2021-45105", "summary":"No local rule"},
-                    {"id":"GHSA-withdrawn", "withdrawn":"2026-01-01T00:00:00Z"}
-                ]),
-                "pkg:npm/react-server-dom-webpack" => json!([{"id":"CVE-2025-55182"}]),
-                "pkg:npm/unrelated" => json!([{"id":"GHSA-unrelated", "aliases":["CVE-2021-44228"]}, {"id":"GHSA-no-cve"}]),
-                "pkg:maven/org.apache.logging.log4j/log4j-core" => json!([{"id":"CVE-2021-44228"}]),
-                other => panic!("unexpected package {other}"),
-            };
-            Json(json!({"vulns": vulns}))
-        }
-    }));
-    let app = Harness::start_with_osv(&directory.path().join("sbom.json"), osv).await;
-    let inventory = json!({"bomFormat":"CycloneDX", "specVersion":"1.6", "components":[
-        {"name":"application"},
-        {"name":"log4j", "purl":"pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1"},
-        {"name":"duplicate log4j", "purl":"pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1"},
-        {"name":"patched log4j", "purl":"pkg:maven/org.apache.logging.log4j/log4j-core@2.15.0"},
-        {"name":"RSC", "purl":"pkg:npm/react-server-dom-webpack@19.1.0"},
-        {"name":"other", "purl":"pkg:npm/unrelated@1.0.0"},
-        {"name":"unknown version", "purl":"pkg:npm/react-server-dom-parcel"},
-        {"name":"placeholder version", "purl":"pkg:npm/react-server-dom-parcel", "version":" UNKNOWN "},
-        {"name":"invalid version", "purl":"pkg:npm/react-server-dom-parcel", "version":"19.1 0"},
-        {"name":"unsupported", "purl":"pkg:generic/example@1.0.0"}
-    ]});
-    let response = app.upload(&inventory.to_string()).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let response: Value = serde_json::from_str(&response.text().await.unwrap()).unwrap();
-    let report = &response["policy"]["osv"];
-    assert_eq!(report["status"], "partial");
-    assert_eq!(report["summary"]["queried_packages"], 4);
-    assert_eq!(report["summary"]["skipped_components"], 5);
-    assert_eq!(report["summary"]["advisories"], 6);
-    assert_eq!(report["summary"]["with_blocking_rules"], 2);
-    assert_eq!(report["summary"]["uncovered"], 4);
-    assert_eq!(report["summary"]["uncovered_before_generation"], 4);
-    assert_eq!(report["summary"]["quarantined"], 0);
-    assert_eq!(response["policy"]["ai"]["status"], "not_configured");
-    assert_eq!(response["policy"]["generated_rules"], json!([]));
-    assert_eq!(calls.load(Ordering::SeqCst), 4);
-    let packages = report["packages"].as_array().unwrap();
-    let log4j = packages.iter().find(|p| p["version"] == "2.14.1").unwrap();
-    assert_eq!(log4j["components"].as_array().unwrap().len(), 2);
-    let lookup = log4j["vulnerabilities"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|v| v["id"] == "GHSA-log4shell")
-        .unwrap();
-    assert_eq!(lookup["coverage"], "blocking_rule_available");
-    assert_eq!(lookup["blocking_rules"], json!(["log4shell-lookups"]));
-    assert_eq!(lookup["cves"], json!(["CVE-2021-44228"]));
-    let patched = packages.iter().find(|p| p["version"] == "2.15.0").unwrap();
-    assert_eq!(patched["vulnerabilities"][0]["coverage"], "uncovered");
-    assert_eq!(patched["vulnerabilities"][0]["static_rules"], json!([]));
-    let unrelated = packages
-        .iter()
-        .find(|p| p["package"] == "pkg:npm/unrelated")
-        .unwrap();
-    assert!(
-        unrelated["vulnerabilities"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|v| v["coverage"] == "uncovered" && v["blocking_rules"] == json!([]))
-    );
-    assert_eq!(app.status().await["policy"]["osv"], *report);
-    assert_eq!(
-        app.client.get(&app.public).send().await.unwrap().status(),
-        StatusCode::CREATED
-    );
-}
-
-#[tokio::test]
-async fn osv_follows_pages_without_duplicate_advisories() {
-    let directory = tempfile::tempdir().unwrap();
-    let calls = Arc::new(AtomicUsize::new(0));
-    let count = calls.clone();
-    let osv = Router::new().route(
-        "/v1/query",
-        post(move |Json(query): Json<Value>| {
-            let count = count.clone();
-            async move {
-                count.fetch_add(1, Ordering::SeqCst);
-                let record = json!({"id":"GHSA-log4shell", "aliases":["CVE-2021-44228"]});
-                if query.get("page_token").is_none() {
-                    Json(json!({"vulns":[record], "next_page_token":"second"}))
-                } else {
-                    assert_eq!(query["page_token"], "second");
-                    Json(json!({"vulns":[record, {"id":"CVE-2021-45105"}]}))
-                }
-            }
-        }),
-    );
-    let app = Harness::start_with_osv(&directory.path().join("sbom.json"), osv).await;
-    assert_eq!(app.upload(VULNERABLE).await.status(), StatusCode::OK);
-    let report = app.status().await;
-    assert_eq!(report["policy"]["osv"]["status"], "complete");
-    assert_eq!(report["policy"]["osv"]["summary"]["advisories"], 2);
-    assert_eq!(report["policy"]["osv"]["summary"]["uncovered"], 1);
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
-}
-
-#[tokio::test]
-async fn osv_failures_never_report_a_clean_scan() {
-    for response in [
-        (StatusCode::TOO_MANY_REQUESTS, "rate limited"),
-        (StatusCode::OK, "not json"),
-        (StatusCode::OK, r#"{"unexpected":"response"}"#),
-        (StatusCode::OK, r#"{"error":{"code":500}}"#),
-        (StatusCode::OK, r#"{"vulns":[{"id":"../../unsafe"}]}"#),
-    ] {
-        let directory = tempfile::tempdir().unwrap();
-        let osv = Router::new().fallback(move || async move { response });
-        let app = Harness::start_with_osv(&directory.path().join("sbom.json"), osv).await;
-        assert_eq!(app.upload(VULNERABLE).await.status(), StatusCode::OK);
-        let report = app.status().await;
-        assert_eq!(report["policy"]["osv"]["status"], "failed");
-        assert_eq!(report["policy"]["osv"]["summary"]["failed_packages"], 1);
-        assert!(report["policy"]["osv"]["packages"][0]["error"].is_string());
-        assert_eq!(
-            app.client
-                .post(&app.public)
-                .body("${jndi:test}")
-                .send()
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::FORBIDDEN
-        );
-    }
-}
-
-#[tokio::test]
-async fn local_rules_activate_before_osv_finishes() {
-    let directory = tempfile::tempdir().unwrap();
-    let osv = Router::new().fallback(|| async {
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        Json(json!({}))
-    });
-    let app = Harness::start_with_osv(&directory.path().join("sbom.json"), osv).await;
-    let request = app
-        .client
-        .post(format!("{}/v1/sbom", app.admin))
-        .bearer_auth(TOKEN)
-        .body(VULNERABLE);
-    let upload = tokio::spawn(async move { request.send().await.unwrap() });
-    let report = app.wait_for("/policy/osv/status", json!("pending")).await;
-    assert_eq!(report["ready"], true);
-    assert!(report["policy"]["osv"]["summary"].is_null());
-    assert_eq!(
-        app.client
-            .post(&app.public)
-            .body("${jndi:test}")
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::FORBIDDEN
-    );
-    assert_eq!(app.upload(PATCHED).await.status(), StatusCode::CONFLICT);
-    assert_eq!(
-        app.client.get(&app.public).send().await.unwrap().status(),
-        StatusCode::CREATED
-    );
-    assert_eq!(upload.await.unwrap().status(), StatusCode::OK);
-    let report = app.status().await;
-    assert_eq!(report["policy"]["osv"]["status"], "failed");
-    assert!(
-        report["policy"]["osv"]["error"]
-            .as_str()
-            .unwrap()
-            .contains("deadline")
-    );
-    assert_eq!(report["policy"]["generated_rules"], json!([]));
-    assert_eq!(app.hits.load(Ordering::SeqCst), 1);
-}
-
-#[tokio::test]
-async fn restart_refreshes_osv_from_saved_sbom() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("sbom.json");
-    let app = Harness::start(&path).await;
-    app.upload(VULNERABLE).await;
-    assert_eq!(
-        app.status().await["policy"]["osv"]["summary"]["advisories"],
-        0
-    );
-    drop(app);
-    let osv = Router::new().fallback(|| async { Json(json!({"vulns":[{"id":"CVE-2021-45105"}]})) });
-    let restarted = Harness::start_with_osv(&path, osv).await;
-    assert_eq!(
-        restarted.status().await["policy"]["osv"]["summary"]["uncovered"],
-        1
-    );
-}
-
-#[tokio::test]
-async fn repeated_osv_pages_preserve_partial_findings() {
-    let directory = tempfile::tempdir().unwrap();
-    let osv = Router::new().fallback(|| async {
-        Json(json!({"vulns":[{"id":"CVE-2021-44228"}], "next_page_token":"repeated"}))
-    });
-    let app = Harness::start_with_osv(&directory.path().join("sbom.json"), osv).await;
-    app.upload(VULNERABLE).await;
-    let report = app.status().await;
-    let osv = &report["policy"]["osv"];
-    assert_eq!(osv["status"], "partial");
-    assert_eq!(osv["summary"]["with_blocking_rules"], 1);
-    assert_eq!(osv["summary"]["failed_packages"], 1);
-    assert!(
-        osv["packages"][0]["error"]
-            .as_str()
-            .unwrap()
-            .contains("pagination token")
-    );
-}
-
-#[tokio::test]
-async fn oversized_osv_responses_are_failed_lookups() {
-    let directory = tempfile::tempdir().unwrap();
-    let osv = Router::new().fallback(|| async { vec![b'x'; 4 * 1024 * 1024 + 1] });
-    let app = Harness::start_with_osv(&directory.path().join("sbom.json"), osv).await;
-    app.upload(VULNERABLE).await;
-    let report = app.status().await;
-    assert_eq!(report["policy"]["osv"]["status"], "failed");
-    assert!(
-        report["policy"]["osv"]["packages"][0]["error"]
-            .as_str()
-            .unwrap()
-            .contains("exceeds 4194304 bytes")
-    );
-}
-
 fn openai_reply(enhancements: Value) -> Value {
     json!({"id":"resp-test", "status":"completed", "output":[{"type":"message", "content":[{
         "type":"output_text", "text":review_text(enhancements)
@@ -833,8 +585,128 @@ fn openai_reply(enhancements: Value) -> Value {
 }
 
 fn review_text(enhancements: Value) -> String {
-    json!({"summary":"Reviewed the supplied inventory and evidence.", "enhancements":enhancements})
+    json!({"summary":"Reviewed the supplied inventory and evidence.", "enhancements":enhancements, "discoveries":[]})
         .to_string()
+}
+
+#[tokio::test]
+async fn anthropic_discovers_missing_cves_with_search_provenance_and_cached_continuation() {
+    let directory = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let searched = json!([
+        {"type":"server_tool_use","id":"search-1","name":"web_search","input":{"query":"fictional-runtime security advisory"}},
+        {"type":"web_search_tool_result","tool_use_id":"search-1","content":[{"type":"web_search_result","url":"https://vendor.example/security/advisory","encrypted_content":"opaque-provider-data"}]}
+    ]);
+    let ai = Router::new().route("/leaderboard", get(|| async { Json(test_leaderboard()) }))
+        .route("/v1/messages", post(move |Json(request): Json<Value>| {
+            let count = count.clone();
+            let searched = searched.clone();
+            async move {
+                assert_eq!(request["cache_control"]["type"], "ephemeral");
+                assert_eq!(request["tools"][1]["strict"], true);
+                match count.fetch_add(1, Ordering::SeqCst) {
+                    0 => Json(json!({"id":"paused","stop_reason":"pause_turn","content":searched,
+                        "usage":{"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":200,"server_tool_use":{"web_search_requests":1}}})),
+                    1 => {
+                        assert_eq!(request["messages"][1]["role"], "assistant");
+                        assert_eq!(request["messages"][1]["content"], searched);
+                        Json(json!({"id":"researched","stop_reason":"tool_use","content":[{"type":"tool_use","name":"submit_review","input":{
+                            "summary":"Found a vendor advisory through web research.","enhancements":[],"discoveries":[
+                                {"component_index":0,"cve":"CVE-2026-999901","source":"https://uncited.example/advisory","reason":"An invalid duplicate must not suppress later valid evidence.","fixed_version":"1.0.1"},
+                                {"component_index":0,"cve":"CVE-2026-999901","source":"https://vendor.example/security/advisory","reason":"The vendor reports the exact installed version as affected.","fixed_version":"1.0.1"},
+                                {"component_index":0,"cve":"CVE-2026-999902","source":"https://invented.example/advisory","reason":"Uncited source must be rejected.","fixed_version":"1.0.1"},
+                                {"component_index":999,"cve":"CVE-2026-999903","source":"https://vendor.example/security/advisory","reason":"Unknown component must be rejected.","fixed_version":"1.0.1"}
+                            ]}}],"usage":{"input_tokens":20,"output_tokens":30,"cache_read_input_tokens":200}}))
+                    }
+                    _ => Json(json!({"id":"search-failed","stop_reason":"end_turn","content":[{"type":"web_search_tool_result","content":{"type":"web_search_tool_result_error","error_code":"unavailable"}}]})),
+                }
+            }
+        }));
+    let config = filtr::ai::AiConfig {
+        cache_ttl_secs: 0,
+        anthropic_api_key: Some("test-anthropic-key".into()),
+        ai_timeout_secs: 1,
+        ..Default::default()
+    };
+    let app =
+        Harness::start_configured(&directory.path().join("sbom.json"), Some(ai), config).await;
+    app.upload(r#"{"format":"filtr-1","packages":[{"purl":"pkg:npm/fictional-runtime@1.0.0"}]}"#)
+        .await;
+    let status = app.status().await;
+    assert_eq!(status["policy"]["ai"]["status"], "partial");
+    assert_eq!(
+        status["policy"]["ai"]["discoveries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        status["policy"]["ai"]["rejected"].as_array().unwrap().len(),
+        3
+    );
+    assert_eq!(
+        status["policy"]["ai"]["usage"],
+        json!({"input_tokens":120,"output_tokens":80,"cache_creation_input_tokens":200,"cache_read_input_tokens":200,"web_search_requests":1})
+    );
+    assert_eq!(
+        status["policy"]["generated_rules"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        status["policy"]["generated_rules"][0]["origin"],
+        "ai_discovery"
+    );
+    assert_eq!(
+        status["policy"]["generated_rules"][0]["cves"],
+        json!(["CVE-2026-999901"])
+    );
+    assert_eq!(
+        app.client.get(&app.public).send().await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(app.hits.load(Ordering::SeqCst), 0);
+    app.upload(r#"{"format":"filtr-1","packages":[{"purl":"pkg:npm/fictional-runtime@1.0.1"}]}"#)
+        .await;
+    let status = app.status().await;
+    assert_eq!(status["policy"]["ai"]["status"], "failed");
+    assert_eq!(status["policy"]["generated_rules"], json!([]));
+    assert_eq!(
+        app.client.get(&app.public).send().await.unwrap().status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn openai_discoveries_require_native_web_search_sources() {
+    let directory = tempfile::tempdir().unwrap();
+    let ai = Router::new().route("/v1/responses", post(|Json(request): Json<Value>| async move {
+        assert_eq!(request["tools"][0]["type"], "web_search");
+        assert_eq!(request["include"], json!(["web_search_call.action.sources"]));
+        Json(json!({"id":"researched","status":"completed","output":[
+            {"type":"web_search_call","status":"completed","action":{"sources":[{"url":"https://vendor.example/security/advisory"}]}},
+            {"type":"message","content":[{"type":"output_text","text":json!({"summary":"A new vendor finding.","enhancements":[],"discoveries":[
+                {"component_index":0,"cve":"CVE-2026-999904","source":"https://vendor.example/security/advisory","reason":"Exact installed version is affected according to the vendor.","fixed_version":"1.0.1"}
+            ]}).to_string()}]}
+        ],"usage":{"input_tokens":1000,"output_tokens":100,"input_tokens_details":{"cached_tokens":500}}}))
+    }));
+    let app = Harness::start_with_services(&directory.path().join("sbom.json"), Some(ai)).await;
+    app.upload(r#"{"format":"filtr-1","packages":[{"purl":"pkg:npm/fictional-runtime@1.0.0"}]}"#)
+        .await;
+    let review = &app.status().await["policy"]["ai"];
+    assert_eq!(review["status"], "complete");
+    assert_eq!(review["discoveries"][0]["cve"], "CVE-2026-999904");
+    assert_eq!(review["usage"]["cache_read_input_tokens"], 500);
+    assert_eq!(review["usage"]["web_search_requests"], 1);
+    assert_eq!(
+        app.client.get(&app.public).send().await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
 }
 
 fn test_leaderboard() -> Value {
@@ -867,25 +739,26 @@ async fn anthropic_uses_its_ranked_model_and_native_structured_output() {
             assert!(!headers.contains_key(header::AUTHORIZATION));
             assert_eq!(request["model"], "claude-opus-5");
             assert_eq!(request["thinking"]["type"], "adaptive");
+            assert_eq!(request["tool_choice"]["disable_parallel_tool_use"], true);
             assert_eq!(request["output_config"]["effort"], "max");
-            assert_eq!(request["output_config"]["format"]["type"], "json_schema");
+            assert_eq!(request["cache_control"]["type"], "ephemeral");
+            assert_eq!(request["system"][0]["cache_control"]["type"], "ephemeral");
+            assert_eq!(request["tools"][0]["name"], "web_search");
+            assert_eq!(request["tools"][1]["name"], "submit_review");
+            assert_eq!(request["tools"][1]["strict"], true);
             let input: Value = serde_json::from_str(request["messages"][0]["content"].as_str().unwrap()).unwrap();
             assert_eq!(input["components"].as_array().unwrap().len(), 1);
             assert!(!request.to_string().contains(TOKEN));
             Json(anthropic_reply(json!([{"component_index":0,"basis":"log4shell-lookups","action":"tokens","patterns":["claude-test-marker"],"reason":"Additive test marker."}])))
         }));
     let config = filtr::ai::AiConfig {
+        cache_ttl_secs: 0,
         anthropic_api_key: Some("test-anthropic-key".into()),
         ai_timeout_secs: 1,
         ..Default::default()
     };
-    let app = Harness::start_configured(
-        &directory.path().join("sbom.json"),
-        Router::new().fallback(|| async { Json(json!({})) }),
-        Some(ai),
-        config,
-    )
-    .await;
+    let app =
+        Harness::start_configured(&directory.path().join("sbom.json"), Some(ai), config).await;
     assert_eq!(app.upload(VULNERABLE).await.status(), StatusCode::OK);
     let status = app.status().await;
     assert_eq!(status["policy"]["ai"]["status"], "complete");
@@ -941,19 +814,15 @@ async fn anthropic_failure_falls_back_to_luna_with_separate_credentials() {
             ),
         );
     let config = filtr::ai::AiConfig {
+        cache_ttl_secs: 0,
         provider: Some(filtr::ai::Provider::Anthropic),
         api_key: Some("test-openai-key".into()),
         anthropic_api_key: Some("test-anthropic-key".into()),
         ai_timeout_secs: 1,
         ..Default::default()
     };
-    let app = Harness::start_configured(
-        &directory.path().join("sbom.json"),
-        Router::new().fallback(|| async { Json(json!({"vulns":[{"id":"CVE-2021-45105"}]})) }),
-        Some(ai),
-        config,
-    )
-    .await;
+    let app =
+        Harness::start_configured(&directory.path().join("sbom.json"), Some(ai), config).await;
     app.upload(VULNERABLE).await;
     let review = &app.status().await["policy"]["ai"];
     assert_eq!(review["status"], "complete");
@@ -969,12 +838,8 @@ async fn anthropic_failure_falls_back_to_luna_with_separate_credentials() {
     );
     assert!(review["attempts"][1]["error"].is_null());
     assert_eq!(
-        app.status().await["policy"]["osv"]["summary"]["quarantined"],
-        1
-    );
-    assert_eq!(
         app.client.get(&app.public).send().await.unwrap().status(),
-        StatusCode::FORBIDDEN
+        StatusCode::CREATED
     );
 }
 
@@ -998,17 +863,13 @@ async fn leaderboard_refreshes_each_upload_and_primary_timeout_uses_luna() {
         Json(openai_reply(json!([])))
     }));
     let config = filtr::ai::AiConfig {
+        cache_ttl_secs: 0,
         api_key: Some("test-openai-key".into()),
         ai_timeout_secs: 1,
         ..Default::default()
     };
-    let app = Harness::start_configured(
-        &directory.path().join("sbom.json"),
-        Router::new().fallback(|| async { Json(json!({})) }),
-        Some(ai),
-        config,
-    )
-    .await;
+    let app =
+        Harness::start_configured(&directory.path().join("sbom.json"), Some(ai), config).await;
     app.upload(VULNERABLE).await;
     let review = &app.status().await["policy"]["ai"];
     assert_eq!(review["status"], "complete");
@@ -1042,12 +903,12 @@ async fn leaderboard_is_reused_on_restart_and_refreshed_only_by_valid_uploads() 
         }
     })).route("/v1/responses", post(|| async { Json(openai_reply(json!([]))) }));
     let config = filtr::ai::AiConfig {
+        cache_ttl_secs: 0,
         api_key: Some("test-openai-key".into()),
         ai_timeout_secs: 1,
         ..Default::default()
     };
-    let osv = Router::new().fallback(|| async { Json(json!({})) });
-    let app = Harness::start_configured(&path, osv.clone(), Some(ai.clone()), config.clone()).await;
+    let app = Harness::start_configured(&path, Some(ai.clone()), config.clone()).await;
     app.upload(VULNERABLE).await;
     assert_eq!(app.status().await["policy"]["ai"]["model"], "first-winner");
     assert_eq!(
@@ -1056,8 +917,7 @@ async fn leaderboard_is_reused_on_restart_and_refreshed_only_by_valid_uploads() 
     );
     assert!(directory.path().join("sbom.json.leaderboard.json").exists());
     drop(app);
-    let restarted =
-        Harness::start_configured(&path, osv.clone(), Some(ai.clone()), config.clone()).await;
+    let restarted = Harness::start_configured(&path, Some(ai.clone()), config.clone()).await;
     let review = &restarted.status().await["policy"]["ai"];
     assert_eq!(review["model"], "first-winner");
     assert_eq!(review["leaderboard_source"], "saved_snapshot");
@@ -1076,7 +936,7 @@ async fn leaderboard_is_reused_on_restart_and_refreshed_only_by_valid_uploads() 
     drop(restarted);
     // Editing the persisted inventory cannot make its old leaderboard snapshot applicable.
     std::fs::write(&path, VULNERABLE).unwrap();
-    let changed = Harness::start_configured(&path, osv, Some(ai), config).await;
+    let changed = Harness::start_configured(&path, Some(ai), config).await;
     let review = &changed.status().await["policy"]["ai"];
     assert_eq!(review["model"], "gpt-5.6-luna");
     assert!(
@@ -1118,17 +978,12 @@ async fn missing_or_corrupt_saved_leaderboards_never_trigger_startup_fetches() {
                 }),
             );
         let config = filtr::ai::AiConfig {
+            cache_ttl_secs: 0,
             api_key: Some("test-openai-key".into()),
             ai_timeout_secs: 1,
             ..Default::default()
         };
-        let app = Harness::start_configured(
-            &path,
-            Router::new().fallback(|| async { Json(json!({})) }),
-            Some(ai),
-            config,
-        )
-        .await;
+        let app = Harness::start_configured(&path, Some(ai), config).await;
         let review = &app.status().await["policy"]["ai"];
         assert_eq!(review["status"], "complete");
         assert_eq!(review["fallback_used"], true);
@@ -1162,18 +1017,14 @@ async fn invalid_leaderboards_use_luna_only_when_openai_is_configured() {
                 }),
             );
         let config = filtr::ai::AiConfig {
+            cache_ttl_secs: 0,
             api_key: has_openai.then(|| "test-openai-key".into()),
             anthropic_api_key: Some("test-anthropic-key".into()),
             ai_timeout_secs: 1,
             ..Default::default()
         };
-        let app = Harness::start_configured(
-            &directory.path().join("sbom.json"),
-            Router::new().fallback(|| async { Json(json!({})) }),
-            Some(ai),
-            config,
-        )
-        .await;
+        let app =
+            Harness::start_configured(&directory.path().join("sbom.json"), Some(ai), config).await;
         app.upload(VULNERABLE).await;
         let status = app.status().await;
         let review = &status["policy"]["ai"];
@@ -1218,15 +1069,13 @@ async fn anthropic_refusals_and_truncation_keep_static_mappings_without_openai()
                 }),
             );
         let config = filtr::ai::AiConfig {
+            cache_ttl_secs: 0,
             anthropic_api_key: Some("test-anthropic-key".into()),
             ai_timeout_secs: 1,
             ..Default::default()
         };
-        let osv =
-            Router::new().fallback(|| async { Json(json!({"vulns":[{"id":"CVE-2021-45105"}]})) });
         let app =
-            Harness::start_configured(&directory.path().join("sbom.json"), osv, Some(ai), config)
-                .await;
+            Harness::start_configured(&directory.path().join("sbom.json"), Some(ai), config).await;
         app.upload(VULNERABLE).await;
         let status = app.status().await;
         assert_eq!(status["policy"]["ai"]["status"], "failed");
@@ -1235,7 +1084,6 @@ async fn anthropic_refusals_and_truncation_keep_static_mappings_without_openai()
             1
         );
         assert_eq!(status["policy"]["generated_rules"], json!([]));
-        assert_eq!(status["policy"]["osv"]["summary"]["uncovered"], 1);
         assert_eq!(
             app.client.get(&app.public).send().await.unwrap().status(),
             StatusCode::CREATED
@@ -1256,26 +1104,25 @@ async fn anthropic_refusals_and_truncation_keep_static_mappings_without_openai()
 #[tokio::test]
 async fn generated_quarantine_blocks_every_method_and_clears_after_patching() {
     let directory = tempfile::tempdir().unwrap();
-    let osv = Router::new().route(
-        "/v1/query",
-        post(|Json(query): Json<Value>| async move {
-            if query["version"] == "1.0.0.RELEASE" {
-                Json(json!({"vulns":[{"id":"CVE-2026-12345"}]}))
+    let ai = Router::new().route(
+        "/v1/responses",
+        post(|Json(request): Json<Value>| async move {
+            let input: Value =
+                serde_json::from_str(request["input"][0]["content"].as_str().unwrap()).unwrap();
+            Json(if input["components"][0]["version"] == "1.0.0.RELEASE" {
+                discovery_reply()
             } else {
-                Json(json!({}))
-            }
+                openai_reply(json!([]))
+            })
         }),
     );
-    let ai = Router::new().fallback(|| async { Json(openai_reply(json!([]))) });
-    let app =
-        Harness::start_with_services(&directory.path().join("sbom.json"), osv, Some(ai)).await;
+    let app = Harness::start_with_services(&directory.path().join("sbom.json"), Some(ai)).await;
     let vulnerable =
         r#"{"format":"filtr-1","packages":[{"purl":"pkg:maven/example/component@1.0.0.RELEASE"}]}"#;
     app.upload(vulnerable).await;
     let status = app.status().await;
-    assert_eq!(status["policy"]["osv"]["summary"]["quarantined"], 1);
     let generated = &status["policy"]["generated_rules"][0];
-    assert_eq!(generated["origin"], "osv_quarantine");
+    assert_eq!(generated["origin"], "ai_discovery");
     assert_eq!(generated["version"], "1.0.0.RELEASE");
     assert_eq!(generated["action"]["type"], "deny_all");
     for method in [
@@ -1305,22 +1152,19 @@ async fn generated_quarantine_blocks_every_method_and_clears_after_patching() {
 }
 
 #[tokio::test]
-async fn restart_without_ai_uses_static_rules_even_when_osv_is_down() {
+async fn restart_without_ai_uses_static_rules() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("sbom.json");
-    let osv = Router::new().fallback(|| async { Json(json!({"vulns":[{"id":"CVE-2021-45105"}]})) });
-    let ai = Router::new().fallback(|| async { Json(openai_reply(json!([]))) });
-    let app = Harness::start_with_services(&path, osv, Some(ai)).await;
+    let ai = Router::new().fallback(|| async { Json(discovery_reply()) });
+    let app = Harness::start_with_services(&path, Some(ai)).await;
     app.upload(VULNERABLE).await;
     assert_eq!(
         app.client.get(&app.public).send().await.unwrap().status(),
         StatusCode::FORBIDDEN
     );
     drop(app);
-    let outage = Router::new().fallback(|| async { StatusCode::SERVICE_UNAVAILABLE });
-    let restarted = Harness::start_with_osv(&path, outage).await;
+    let restarted = Harness::start(&path).await;
     let status = restarted.status().await;
-    assert_eq!(status["policy"]["osv"]["status"], "failed");
     assert_eq!(status["policy"]["ai"]["status"], "not_configured");
     assert_eq!(status["policy"]["generated_rules"], json!([]));
     assert_eq!(
@@ -1350,7 +1194,6 @@ async fn restart_without_ai_uses_static_rules_even_when_osv_is_down() {
 #[tokio::test]
 async fn openai_enhances_curated_rules_without_replacing_them() {
     let directory = tempfile::tempdir().unwrap();
-    let osv = Router::new().fallback(|| async { Json(json!({"vulns":[{"id":"CVE-2021-44228", "details":"Lookup substitution is interpreted by the installed package."}]})) });
     let ai = Router::new().route("/v1/responses", post(|headers: axum::http::HeaderMap, Json(request): Json<Value>| async move {
         assert_eq!(headers[header::AUTHORIZATION], "Bearer test-openai-key");
         assert_eq!(request["model"], "gpt-6-sol");
@@ -1360,18 +1203,17 @@ async fn openai_enhances_curated_rules_without_replacing_them() {
         let input: Value = serde_json::from_str(request["input"][0]["content"].as_str().unwrap()).unwrap();
         assert_eq!(input["components"].as_array().unwrap().len(), 1);
         assert_eq!(input["curated_rules"][0]["id"], "log4shell-lookups");
-        assert!(input["findings"][0]["vulnerabilities"][0]["details"].is_string());
+        assert!(input.get("findings").is_none());
+        assert!(input.get("osv").is_none());
         assert!(!request.to_string().contains(TOKEN));
         Json(openai_reply(json!([{"component_index":0,"basis":"log4shell-lookups","action":"tokens","patterns":["ai-added-marker"],"reason":"Test additive marker justified by supplied evidence."}])))
     }));
-    let app =
-        Harness::start_with_services(&directory.path().join("sbom.json"), osv, Some(ai)).await;
+    let app = Harness::start_with_services(&directory.path().join("sbom.json"), Some(ai)).await;
     assert_eq!(app.upload(VULNERABLE).await.status(), StatusCode::OK);
     let status = app.status().await;
     assert_eq!(status["policy"]["ai"]["status"], "complete");
     assert_eq!(status["policy"]["ai"]["components_reviewed"], 1);
     assert_eq!(status["policy"]["ai"]["applied_rules"], json!(["ai:0"]));
-    assert_eq!(status["policy"]["osv"]["summary"]["ai_rule_matches"], 1);
     assert_eq!(
         status["policy"]["active_rules"][0]["id"],
         "log4shell-lookups"
@@ -1407,16 +1249,14 @@ async fn openai_enhances_curated_rules_without_replacing_them() {
 #[tokio::test]
 async fn invalid_ai_proposals_cannot_weaken_quarantine() {
     let directory = tempfile::tempdir().unwrap();
-    let osv = Router::new().fallback(|| async { Json(json!({"vulns":[{"id":"CVE-2021-45105"}]})) });
     let ai = Router::new().fallback(|| async { Json(openai_reply(json!([
-        {"component_index":0,"basis":"CVE-2021-45105","action":"tokens","patterns":["extra-marker"],"reason":"An additive test marker."},
-        {"component_index":0,"basis":"CVE-2021-45105","action":"allow","patterns":[],"reason":"Remove quarantine."},
-        {"component_index":99,"basis":"CVE-2021-45105","action":"deny_all","patterns":[],"reason":"Invalid component."},
+        {"component_index":0,"basis":"log4shell-lookups","action":"deny_all","patterns":[],"reason":"An additive test marker."},
+        {"component_index":0,"basis":"log4shell-lookups","action":"allow","patterns":[],"reason":"Remove quarantine."},
+        {"component_index":99,"basis":"log4shell-lookups","action":"deny_all","patterns":[],"reason":"Invalid component."},
         {"component_index":0,"basis":"CVE-2099-99999","action":"deny_all","patterns":[],"reason":"Invented CVE."},
-        {"component_index":0,"basis":"CVE-2021-45105","action":"tokens","patterns":[],"reason":"Empty patterns."}
+        {"component_index":0,"basis":"log4shell-lookups","action":"tokens","patterns":[],"reason":"Empty patterns."}
     ]))) });
-    let app =
-        Harness::start_with_services(&directory.path().join("sbom.json"), osv, Some(ai)).await;
+    let app = Harness::start_with_services(&directory.path().join("sbom.json"), Some(ai)).await;
     app.upload(VULNERABLE).await;
     let status = app.status().await;
     assert_eq!(status["policy"]["ai"]["status"], "partial");
@@ -1425,10 +1265,7 @@ async fn invalid_ai_proposals_cannot_weaken_quarantine() {
         4
     );
     assert_eq!(status["policy"]["ai"]["applied_rules"], json!(["ai:0"]));
-    assert_eq!(
-        status["policy"]["generated_rules"][0]["origin"],
-        "osv_quarantine"
-    );
+    assert_eq!(status["policy"]["generated_rules"][0]["origin"], "ai");
     assert_eq!(
         status["policy"]["generated_rules"][0]["action"]["type"],
         "deny_all"
@@ -1462,8 +1299,6 @@ async fn ai_failures_replace_previous_enhancements_with_static_rules() {
     ];
     for (code, value) in cases {
         let directory = tempfile::tempdir().unwrap();
-        let osv =
-            Router::new().fallback(|| async { Json(json!({"vulns":[{"id":"CVE-2021-45105"}]})) });
         let calls = Arc::new(AtomicUsize::new(0));
         let ai = Router::new().fallback(move || {
             let value = value.clone();
@@ -1476,13 +1311,12 @@ async fn ai_failures_replace_previous_enhancements_with_static_rules() {
                 }
             }
         });
-        let app =
-            Harness::start_with_services(&directory.path().join("sbom.json"), osv, Some(ai)).await;
+        let app = Harness::start_with_services(&directory.path().join("sbom.json"), Some(ai)).await;
         assert_eq!(app.upload(VULNERABLE).await.status(), StatusCode::OK);
         assert_eq!(app.status().await["policy"]["ai"]["status"], "complete");
         assert_eq!(
             app.client.get(&app.public).send().await.unwrap().status(),
-            StatusCode::FORBIDDEN
+            StatusCode::CREATED
         );
         assert_eq!(app.upload(VULNERABLE).await.status(), StatusCode::OK);
         let status = app.status().await;
@@ -1494,8 +1328,6 @@ async fn ai_failures_replace_previous_enhancements_with_static_rules() {
             2
         );
         assert_eq!(status["policy"]["generated_rules"], json!([]));
-        assert_eq!(status["policy"]["osv"]["summary"]["quarantined"], 0);
-        assert_eq!(status["policy"]["osv"]["summary"]["uncovered"], 1);
         assert_eq!(
             app.client
                 .post(&app.public)
@@ -1519,17 +1351,25 @@ async fn ai_failures_replace_previous_enhancements_with_static_rules() {
     }
 }
 
-fn large_advisory_inventory() -> Router {
-    Router::new().fallback(|| async {
-        let vulns: Vec<_> = (0..50)
-            .map(|index| json!({"id":format!("CVE-2026-{:05}", index), "details":"x".repeat(8192)}))
-            .collect();
-        Json(json!({"vulns": vulns}))
-    })
+fn discovery_reply() -> Value {
+    json!({"id":"research", "status":"completed", "output":[
+        {"type":"web_search_call","status":"completed","action":{"sources":[{"url":"https://vendor.example/advisory"}]}},
+        {"type":"message","content":[{"type":"output_text","text":json!({"summary":"An affected installed version.","enhancements":[],"discoveries":[
+            {"component_index":0,"cve":"CVE-2026-12345","source":"https://vendor.example/advisory","reason":"The vendor lists this exact version as affected through HTTP.","fixed_version":"1.0.1.RELEASE"}
+        ]}).to_string()}]}
+    ]})
+}
+
+fn large_inventory() -> String {
+    let mut packages: Vec<_> = (0..3000)
+        .map(|i| json!({"purl":format!("pkg:npm/package-{i}@1.0.0")}))
+        .collect();
+    packages[0] = json!({"purl":"pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1"});
+    json!({"format":"filtr-1","packages":packages}).to_string()
 }
 
 #[tokio::test]
-async fn large_ai_reviews_send_every_advisory_in_bounded_batches() {
+async fn large_ai_reviews_send_every_component_in_bounded_batches() {
     let directory = tempfile::tempdir().unwrap();
     let requests = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
     let captured = requests.clone();
@@ -1548,34 +1388,31 @@ async fn large_ai_reviews_send_every_advisory_in_bounded_batches() {
             }
         }),
     );
-    let app = Harness::start_with_services(
-        &directory.path().join("sbom.json"),
-        large_advisory_inventory(),
-        Some(ai),
-    )
-    .await;
-    assert_eq!(app.upload(VULNERABLE).await.status(), StatusCode::OK);
+    let app = Harness::start_with_services(&directory.path().join("sbom.json"), Some(ai)).await;
+    assert_eq!(
+        app.upload(&large_inventory()).await.status(),
+        StatusCode::OK
+    );
     let status = app.status().await;
     assert_eq!(status["policy"]["ai"]["status"], "complete");
-    assert_eq!(status["policy"]["ai"]["components_reviewed"], 1);
-    assert_eq!(status["policy"]["ai"]["batches_total"], 4);
-    assert_eq!(status["policy"]["ai"]["batches_completed"], 4);
+    assert_eq!(status["policy"]["ai"]["components_reviewed"], 3000);
+    assert!(status["policy"]["ai"]["batches_total"].as_u64().unwrap() > 1);
+    assert_eq!(
+        status["policy"]["ai"]["batches_completed"],
+        status["policy"]["ai"]["batches_total"]
+    );
     assert!(status["policy"]["ai"]["input_bytes"].as_u64().unwrap() > 256 * 1024);
-    assert_eq!(status["policy"]["osv"]["summary"]["quarantined"], 50);
     let sent = requests.lock().unwrap();
-    assert_eq!(sent.len(), 4);
-    let ids: std::collections::BTreeSet<_> = sent
+    assert_eq!(
+        sent.len(),
+        status["policy"]["ai"]["batches_total"].as_u64().unwrap() as usize
+    );
+    let indexes: std::collections::BTreeSet<_> = sent
         .iter()
-        .flat_map(|input| {
-            input["findings"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .flat_map(|p| p["vulnerabilities"].as_array().unwrap())
-                .map(|v| v["id"].as_str().unwrap().to_owned())
-        })
+        .flat_map(|input| input["components"].as_array().unwrap())
+        .map(|c| c["component_index"].as_u64().unwrap())
         .collect();
-    assert_eq!(ids, (0..50).map(|i| format!("CVE-2026-{i:05}")).collect());
+    assert_eq!(indexes, (0..3000).collect());
 }
 
 #[tokio::test]
@@ -1583,23 +1420,26 @@ async fn a_failed_batch_discards_successful_batch_enhancements() {
     let directory = tempfile::tempdir().unwrap();
     let ai = Router::new().route("/v1/responses", post(|Json(request): Json<Value>| async move {
         let input: Value = serde_json::from_str(request["input"][0]["content"].as_str().unwrap()).unwrap();
-        let is_last = input["findings"].as_array().unwrap().iter().any(|p| p["vulnerabilities"][0]["id"] == "CVE-2026-00049");
+        let is_last = input["components"].as_array().unwrap().iter().any(|c| c["component_index"] == 2999);
         if is_last {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             return StatusCode::BAD_REQUEST.into_response();
         }
         Json(openai_reply(json!([{"component_index":0,"basis":"log4shell-lookups","action":"tokens","patterns":["batch-marker"],"reason":"Test enhancement that must not activate after another batch fails."}]))).into_response()
     }));
-    let app = Harness::start_with_services(
-        &directory.path().join("sbom.json"),
-        large_advisory_inventory(),
-        Some(ai),
-    )
-    .await;
-    assert_eq!(app.upload(VULNERABLE).await.status(), StatusCode::OK);
+    let app = Harness::start_with_services(&directory.path().join("sbom.json"), Some(ai)).await;
+    assert_eq!(
+        app.upload(&large_inventory()).await.status(),
+        StatusCode::OK
+    );
     let status = app.status().await;
     assert_eq!(status["policy"]["ai"]["status"], "failed");
-    assert_eq!(status["policy"]["ai"]["batches_completed"], 3);
+    assert!(
+        status["policy"]["ai"]["batches_completed"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
     assert_eq!(status["policy"]["generated_rules"], json!([]));
     assert_eq!(
         app.client
@@ -1626,18 +1466,16 @@ async fn a_failed_batch_discards_successful_batch_enhancements() {
 #[tokio::test]
 async fn generated_rules_activate_only_after_ai_review_succeeds() {
     let directory = tempfile::tempdir().unwrap();
-    let osv = Router::new().fallback(|| async { Json(json!({"vulns":[{"id":"CVE-2021-45105"}]})) });
     let finish_review = Arc::new(tokio::sync::Notify::new());
     let completion = finish_review.clone();
     let ai = Router::new().fallback(move || {
         let completion = completion.clone();
         async move {
             completion.notified().await;
-            Json(openai_reply(json!([])))
+            Json(discovery_reply())
         }
     });
-    let app =
-        Harness::start_with_services(&directory.path().join("sbom.json"), osv, Some(ai)).await;
+    let app = Harness::start_with_services(&directory.path().join("sbom.json"), Some(ai)).await;
     let request = app
         .client
         .post(format!("{}/v1/sbom", app.admin))
@@ -1645,8 +1483,17 @@ async fn generated_rules_activate_only_after_ai_review_succeeds() {
         .body(VULNERABLE);
     let upload = tokio::spawn(async move { request.send().await.unwrap() });
     let pending = app.wait_for("/policy/ai/status", json!("pending")).await;
+    assert_eq!(
+        app.client
+            .post(format!("{}/v1/refresh", app.admin))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
     assert_eq!(pending["policy"]["generated_rules"], json!([]));
-    assert_eq!(pending["policy"]["osv"]["summary"]["uncovered"], 1);
     assert_eq!(
         app.client.get(&app.public).send().await.unwrap().status(),
         StatusCode::CREATED
@@ -1655,7 +1502,6 @@ async fn generated_rules_activate_only_after_ai_review_succeeds() {
     assert_eq!(upload.await.unwrap().status(), StatusCode::OK);
     let complete = app.status().await;
     assert_eq!(complete["policy"]["ai"]["status"], "complete");
-    assert_eq!(complete["policy"]["osv"]["summary"]["quarantined"], 1);
     assert_eq!(
         app.client.get(&app.public).send().await.unwrap().status(),
         StatusCode::FORBIDDEN
@@ -1666,13 +1512,12 @@ async fn generated_rules_activate_only_after_ai_review_succeeds() {
 #[tokio::test]
 async fn static_rules_remain_active_while_ai_is_pending_and_after_timeout() {
     let directory = tempfile::tempdir().unwrap();
-    let osv = Router::new().fallback(|| async { Json(json!({"vulns":[{"id":"CVE-2021-45105"}]})) });
     let ai = Router::new().fallback(|| async {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         Json(openai_reply(json!([])))
     });
     let path = directory.path().join("sbom.json");
-    let app = Harness::start_with_services(&path, osv.clone(), Some(ai.clone())).await;
+    let app = Harness::start_with_services(&path, Some(ai.clone())).await;
     let request = app
         .client
         .post(format!("{}/v1/sbom", app.admin))
@@ -1681,7 +1526,6 @@ async fn static_rules_remain_active_while_ai_is_pending_and_after_timeout() {
     let upload = tokio::spawn(async move { request.send().await.unwrap() });
     let status = app.wait_for("/policy/ai/status", json!("pending")).await;
     assert_eq!(status["policy"]["generated_rules"], json!([]));
-    assert_eq!(status["policy"]["osv"]["summary"]["uncovered"], 1);
     assert_eq!(
         app.client.get(&app.public).send().await.unwrap().status(),
         StatusCode::CREATED
@@ -1706,7 +1550,7 @@ async fn static_rules_remain_active_while_ai_is_pending_and_after_timeout() {
     );
     assert_eq!(app.hits.load(Ordering::SeqCst), 2);
     drop(app);
-    let restarted = Harness::start_with_services(&path, osv, Some(ai)).await;
+    let restarted = Harness::start_with_services(&path, Some(ai)).await;
     let status = restarted.status().await;
     assert_eq!(status["policy"]["ai"]["status"], "failed");
     assert_eq!(status["policy"]["generated_rules"], json!([]));
@@ -1730,5 +1574,293 @@ async fn static_rules_remain_active_while_ai_is_pending_and_after_timeout() {
             .unwrap()
             .status(),
         StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn incomplete_inventory_is_reported_without_database_guards() {
+    let directory = tempfile::tempdir().unwrap();
+    let ai = Router::new().fallback(|| async { Json(openai_reply(json!([]))) });
+    let app = Harness::start_with_services(&directory.path().join("sbom.json"), Some(ai)).await;
+    let sbom = r#"{"bomFormat":"CycloneDX","specVersion":"1.6","components":[
+        {"type":"application","name":"unknown-application"},
+        {"type":"library","name":"module","purl":"pkg:golang/example/module@UNKNOWN"},
+        {"type":"application","name":"runtime","purl":"pkg:generic/runtime@1.2.3"}
+    ]}"#;
+    assert_eq!(app.upload(sbom).await.status(), StatusCode::OK);
+    let status = app.status().await;
+    assert!(status["policy"].get("osv").is_none());
+    assert_eq!(
+        status["policy"]["inventory_gaps"],
+        json!([
+            {"component_index":0,"reason":"missing_purl"},
+            {"component_index":0,"reason":"missing_or_unknown_version"},
+            {"component_index":1,"reason":"missing_or_unknown_version"}
+        ])
+    );
+    assert_eq!(status["policy"]["ai"]["components_reviewed"], 3);
+    assert_eq!(status["policy"]["generated_rules"], json!([]));
+    assert_eq!(
+        app.client.get(&app.public).send().await.unwrap().status(),
+        StatusCode::CREATED
+    );
+}
+
+#[tokio::test]
+async fn pinned_models_reuse_component_reviews_across_uploads_and_offline_restarts() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sbom.json");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let ai = Router::new()
+        .route(
+            "/leaderboard",
+            get(|| async {
+                panic!("pinned models must not fetch rankings");
+                #[allow(unreachable_code)]
+                StatusCode::BAD_REQUEST
+            }),
+        )
+        .route(
+            "/v1/responses",
+            post(move |Json(request): Json<Value>| {
+                let count = count.clone();
+                async move {
+                    assert_eq!(request["model"], "budget-test-model");
+                    assert!(request.get("reasoning").is_none());
+                    let input: Value =
+                        serde_json::from_str(request["input"][0]["content"].as_str().unwrap())
+                            .unwrap();
+                    let call = count.fetch_add(1, Ordering::SeqCst);
+                    let components = input["components"].as_array().unwrap();
+                    match call {
+                        0 => {
+                            assert_eq!(components.len(), 2);
+                            Json(discovery_reply())
+                        }
+                        1 => {
+                            assert_eq!(components.len(), 1);
+                            assert_eq!(components[0]["component_index"], 2);
+                            Json(openai_reply(json!([])))
+                        }
+                        2 => {
+                            assert_eq!(components.len(), 3);
+                            Json(openai_reply(json!([])))
+                        }
+                        _ => panic!("unexpected paid review"),
+                    }
+                }
+            }),
+        );
+    let config = filtr::ai::AiConfig {
+        api_key: Some("test-key".into()),
+        model: Some("openai/budget-test-model".into()),
+        ..Default::default()
+    };
+    let app = Harness::start_configured(&path, Some(ai), config).await;
+    assert_eq!(
+        app.client
+            .post(format!("{}/v1/refresh", app.admin))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        app.client
+            .post(format!("{}/v1/refresh", app.admin))
+            .bearer_auth(TOKEN)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let first = r#"{"format":"filtr-1","packages":[{"purl":"pkg:npm/a@1.0.0"},{"purl":"pkg:npm/b@1.0.0"}]}"#;
+    app.upload(first).await;
+    assert_eq!(app.status().await["policy"]["ai"]["cache"]["misses"], 2);
+    assert!(directory.path().join("sbom.json.ai-cache.json").exists());
+    let reordered = r#"{"format":"filtr-1","packages":[{"purl":"pkg:npm/b@1.0.0"},{"purl":"pkg:npm/a@1.0.0"}]}"#;
+    app.upload(reordered).await;
+    let status = app.status().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(status["policy"]["ai"]["cache"]["hits"], 2);
+    assert_eq!(
+        status["policy"]["ai"]["discoveries"][0]["component_index"],
+        1
+    );
+    assert_eq!(
+        status["policy"]["generated_rules"][0]["package"],
+        "pkg:npm/a"
+    );
+    let added = r#"{"format":"filtr-1","packages":[{"purl":"pkg:npm/b@1.0.0"},{"purl":"pkg:npm/a@1.0.0"},{"purl":"pkg:npm/c@2.0.0"}]}"#;
+    app.upload(added).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(app.status().await["policy"]["ai"]["cache"]["hits"], 2);
+    let response = app
+        .client
+        .post(format!("{}/v1/refresh", app.admin))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+    assert_eq!(app.status().await["policy"]["ai"]["cache"]["hits"], 0);
+    assert_eq!(app.status().await["policy"]["generated_rules"], json!([]));
+    let config = app.ai_config.clone();
+    drop(app);
+    // The mock provider is now offline. A restart must restore cached negative reviews without calling it.
+    let restarted = Harness::start_configured(&path, None, config).await;
+    let status = restarted.status().await;
+    assert_eq!(status["policy"]["ai"]["status"], "complete");
+    assert_eq!(status["policy"]["ai"]["cache"]["hits"], 3);
+    assert_eq!(status["policy"]["ai"]["attempts"], json!([]));
+    assert_eq!(
+        restarted
+            .client
+            .get(&restarted.public)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CREATED
+    );
+}
+
+#[tokio::test]
+async fn expiration_automatically_refreshes_the_unchanged_running_inventory() {
+    let directory = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let ai = Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let count = count.clone();
+            async move {
+                Json(if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    openai_reply(json!([]))
+                } else {
+                    discovery_reply()
+                })
+            }
+        }),
+    );
+    let config = filtr::ai::AiConfig {
+        api_key: Some("test-key".into()),
+        model: Some("openai/budget-test-model".into()),
+        cache_ttl_secs: 1,
+        ..Default::default()
+    };
+    let app =
+        Harness::start_configured(&directory.path().join("sbom.json"), Some(ai), config).await;
+    app.upload(VULNERABLE).await;
+    assert_eq!(app.status().await["policy"]["generated_rules"], json!([]));
+    let refreshed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let status = app.status().await;
+            if !status["policy"]["generated_rules"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+            {
+                break status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(refreshed["policy"]["ai"]["status"], "complete");
+    assert_eq!(refreshed["policy"]["ai"]["cache"]["hits"], 0);
+    assert_eq!(
+        app.client.get(&app.public).send().await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn failed_automatic_refresh_uses_static_rules_without_a_paid_retry_loop() {
+    let directory = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let ai = Router::new().route(
+        "/v1/messages",
+        post(move |Json(request): Json<Value>| {
+            let count = count.clone();
+            async move {
+                assert_eq!(request["model"], "budget-test-model");
+                assert!(request.get("thinking").is_none());
+                assert!(request.get("output_config").is_none());
+                if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Json(anthropic_reply(json!([]))).into_response()
+                } else {
+                    StatusCode::BAD_REQUEST.into_response()
+                }
+            }
+        }),
+    );
+    let config = filtr::ai::AiConfig {
+        anthropic_api_key: Some("test-key".into()),
+        model: Some("anthropic/budget-test-model".into()),
+        cache_ttl_secs: 1,
+        ..Default::default()
+    };
+    let app =
+        Harness::start_configured(&directory.path().join("sbom.json"), Some(ai), config).await;
+    app.upload(VULNERABLE).await;
+    let status = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let status = app.status().await;
+            if status["policy"]["ai"]["status"] == "failed" {
+                break status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(status["policy"]["ai"]["cache"]["next_refresh_at"].is_null());
+    assert_eq!(status["policy"]["generated_rules"], json!([]));
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        app.client.get(&app.public).send().await.unwrap().status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        app.client
+            .post(&app.public)
+            .body("${jndi:test}")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn explicit_refresh_clears_cache_without_provider_credentials() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sbom.json");
+    let app = Harness::start(&path).await;
+    app.upload(VULNERABLE).await;
+    let cache = directory.path().join("sbom.json.ai-cache.json");
+    std::fs::write(&cache, "stale cache").unwrap();
+    let response = app
+        .client
+        .post(format!("{}/v1/refresh", app.admin))
+        .bearer_auth(TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!cache.exists());
+    assert_eq!(
+        app.status().await["policy"]["ai"]["status"],
+        "not_configured"
     );
 }

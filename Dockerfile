@@ -39,6 +39,6 @@ ENV FILTR_LISTEN=0.0.0.0:8080 \
     FILTR_SBOM=/data/sbom.json
 EXPOSE 8080
 STOPSIGNAL SIGTERM
-HEALTHCHECK --interval=30s --timeout=5s --start-period=1560s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=5s --start-period=960s --retries=3 \
     CMD ["/usr/local/bin/filtr-probe", "live"]
 ENTRYPOINT ["/usr/local/bin/filtr"]

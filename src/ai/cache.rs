@@ -1,0 +1,505 @@
+use super::{
+    AiConfig, INSTRUCTIONS, Proposal, Reply, ReviewTrigger, ReviewedBatch, batches, models::Target,
+    output_schema, research,
+};
+use crate::policy::Report;
+use anyhow::{Context, Result, ensure};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+#[derive(Clone, Default, Serialize)]
+pub struct Stats {
+    pub hits: usize,
+    pub misses: usize,
+    pub deduplicated_components: usize,
+    pub oldest_checked_at: Option<u64>,
+    pub next_refresh_at: Option<u64>,
+    pub models: BTreeSet<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct Data {
+    scope: Value,
+    entries: BTreeMap<String, Entry>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct Entry {
+    checked_at: u64,
+    target: Target,
+    reply: Reply,
+    sources: BTreeSet<String>,
+}
+
+pub(super) struct Store {
+    data: Data,
+    ttl: u64,
+    keys: BTreeMap<usize, String>,
+    aliases: BTreeMap<usize, Vec<usize>>,
+    pub missing: BTreeSet<usize>,
+}
+
+pub(super) fn now() -> Result<u64> {
+    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
+}
+
+pub(super) async fn clear(path: &Path) -> Result<()> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => anyhow::bail!("cannot clear AI review cache"),
+    })
+    .await?
+}
+
+fn scope(config: &AiConfig) -> Value {
+    json!({"version":1,"instructions":INSTRUCTIONS,"schema":output_schema(),
+        "provider":config.provider,"model":config.model,"reasoning":config.reasoning,
+        "openai_url":config.url.as_str(),"anthropic_url":config.anthropic_url.as_str()})
+}
+
+fn component_key(report: &Report, index: usize) -> Result<String> {
+    let item = &report.components[index];
+    let rules: Vec<_> = report
+        .active_rules
+        .iter()
+        .filter(|rule| item.active_rules.contains(&rule.id))
+        .collect();
+    Ok(serde_json::to_string(
+        &json!({"package":item.component.package,"version":item.component.version,
+        "name":item.component.package.is_none().then_some(&item.component.name),"rules":rules}),
+    )?)
+}
+
+fn component_reply(reply: &Reply, index: usize, destination: usize) -> Reply {
+    let enhancements: Vec<Proposal> = reply
+        .enhancements
+        .iter()
+        .filter(|p| p.component_index == index)
+        .cloned()
+        .map(|mut p| {
+            p.component_index = destination;
+            p
+        })
+        .collect();
+    let discoveries: Vec<_> = reply
+        .discoveries
+        .iter()
+        .filter(|d| d.component_index == index)
+        .cloned()
+        .map(|mut d| {
+            d.component_index = destination;
+            d
+        })
+        .collect();
+    Reply {
+        summary: "Reused a completed component review; see cache timestamps for its age.".into(),
+        sources: discoveries.iter().map(|d| d.source.clone()).collect(),
+        enhancements,
+        discoveries,
+        usage: research::Usage::default(),
+    }
+}
+
+impl Store {
+    pub async fn load(path: &Path, config: &AiConfig, trigger: ReviewTrigger) -> Result<Self> {
+        let path = path.to_owned();
+        if matches!(trigger, ReviewTrigger::Refresh) {
+            clear(path.as_path()).await?;
+        }
+        let enabled = config.cache_ttl_secs > 0;
+        let expected = scope(config);
+        let data = tokio::task::spawn_blocking(move || -> Result<Data> {
+            if !enabled {
+                return Ok(Data::default());
+            }
+            match crate::read_bounded(&path) {
+                Ok(bytes) => serde_json::from_slice(&bytes)
+                    .context("invalid AI review cache; use POST /v1/refresh to rebuild it"),
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    Ok(Data::default())
+                }
+                Err(_) => {
+                    anyhow::bail!("cannot read AI review cache; use POST /v1/refresh to rebuild it")
+                }
+            }
+        })
+        .await??;
+        ensure!(
+            data.entries.len() <= 50_000,
+            "AI cache exceeds 50,000 entries"
+        );
+        let data = if data.scope == expected {
+            data
+        } else {
+            Data {
+                scope: expected,
+                entries: BTreeMap::new(),
+            }
+        };
+        Ok(Self {
+            data,
+            ttl: config.cache_ttl_secs,
+            keys: BTreeMap::new(),
+            aliases: BTreeMap::new(),
+            missing: BTreeSet::new(),
+        })
+    }
+
+    pub fn reuse(&mut self, report: &Report, stats: &mut Stats) -> Result<Vec<ReviewedBatch>> {
+        let now = now()?;
+        let mut replies = Vec::new();
+        let mut representatives = BTreeMap::new();
+        for index in 0..report.components.len() {
+            let key = component_key(report, index)?;
+            self.keys.insert(index, key.clone());
+            if let Some(entry) = self.data.entries.get(&key).filter(|entry| {
+                self.ttl > 0
+                    && now
+                        .checked_sub(entry.checked_at)
+                        .is_some_and(|age| age < self.ttl)
+            }) {
+                let mut reply = component_reply(&entry.reply, 0, index);
+                ensure!(
+                    reply
+                        .discoveries
+                        .iter()
+                        .all(|d| entry.sources.contains(&d.source)),
+                    "cached discovery lacks source evidence; use POST /v1/refresh"
+                );
+                reply.sources = entry.sources.clone();
+                replies.push(ReviewedBatch {
+                    batch: batches::cached(report, index),
+                    reply,
+                    target: entry.target.clone(),
+                });
+                stats.hits += 1;
+
+                stats.oldest_checked_at = Some(
+                    stats
+                        .oldest_checked_at
+                        .map_or(entry.checked_at, |old| old.min(entry.checked_at)),
+                );
+                let expires = entry.checked_at.saturating_add(self.ttl);
+                stats.next_refresh_at = Some(
+                    stats
+                        .next_refresh_at
+                        .map_or(expires, |old| old.min(expires)),
+                );
+            } else if let Some(&first) = representatives.get(&key) {
+                self.aliases.entry(first).or_default().push(index);
+                stats.deduplicated_components += 1;
+            } else {
+                representatives.insert(key, index);
+                self.missing.insert(index);
+            }
+        }
+        stats.misses = self.missing.len();
+        Ok(replies)
+    }
+
+    pub fn expand_aliases(&self, report: &Report, replies: &mut Vec<ReviewedBatch>) {
+        let mut aliases = Vec::new();
+        for (first, indexes) in &self.aliases {
+            if let Some(completed) = replies.iter().find(|r| r.batch.includes_component(*first)) {
+                for &index in indexes {
+                    aliases.push(ReviewedBatch {
+                        batch: batches::cached(report, index),
+                        reply: component_reply(&completed.reply, *first, index),
+                        target: completed.target.clone(),
+                    });
+                }
+            }
+        }
+        replies.extend(aliases);
+    }
+
+    pub async fn finish(
+        &mut self,
+        path: &Path,
+        replies: &[ReviewedBatch],
+        review: &mut super::Review,
+    ) {
+        for completed in replies {
+            let prefix = match completed.target.provider {
+                super::Provider::Openai => "openai",
+                super::Provider::Anthropic => "anthropic",
+            };
+            review
+                .cache
+                .models
+                .insert(format!("{prefix}/{}", completed.target.model));
+        }
+        if self.ttl == 0 {
+            return;
+        }
+        if !self.missing.is_empty()
+            && let Ok(at) = now()
+        {
+            review.cache.oldest_checked_at =
+                Some(review.cache.oldest_checked_at.map_or(at, |old| old.min(at)));
+            let expires = at.saturating_add(self.ttl);
+            review.cache.next_refresh_at = Some(
+                review
+                    .cache
+                    .next_refresh_at
+                    .map_or(expires, |old| old.min(expires)),
+            );
+        }
+        if matches!(review.status, super::Status::Complete)
+            && let Err(error) = self.save(path, replies).await
+        {
+            review.cache.error = Some(error.to_string());
+        }
+    }
+
+    async fn save(&mut self, path: &Path, replies: &[ReviewedBatch]) -> Result<Option<u64>> {
+        if self.ttl == 0 || self.missing.is_empty() {
+            return Ok(None);
+        }
+        let checked_at = now()?;
+        for &index in &self.missing {
+            let completed = replies
+                .iter()
+                .find(|r| r.batch.includes_component(index))
+                .context("AI cache component review missing")?;
+            let reply = component_reply(&completed.reply, index, 0);
+            self.data.entries.insert(
+                self.keys[&index].clone(),
+                Entry {
+                    checked_at,
+                    target: completed.target.clone(),
+                    sources: reply.sources.clone(),
+                    reply,
+                },
+            );
+        }
+        self.data.entries.retain(|_, e| {
+            checked_at
+                .checked_sub(e.checked_at)
+                .is_some_and(|age| age < self.ttl)
+        });
+        if self.data.entries.len() > 50_000 {
+            let current: BTreeSet<_> = self.keys.values().collect();
+            let mut old: Vec<_> = self
+                .data
+                .entries
+                .iter()
+                .filter(|(key, _)| !current.contains(key))
+                .map(|(key, e)| (e.checked_at, key.clone()))
+                .collect();
+            old.sort();
+            for (_, key) in old.into_iter().take(self.data.entries.len() - 50_000) {
+                self.data.entries.remove(&key);
+            }
+        }
+        let bytes = serde_json::to_vec(&self.data)?;
+        ensure!(
+            bytes.len() <= crate::sbom::MAX_SBOM_BYTES,
+            "AI review cache exceeds 64 MiB; new results were not cached"
+        );
+        let path: PathBuf = path.to_owned();
+        tokio::task::spawn_blocking(move || crate::persist(&path, &bytes)).await??;
+        Ok(Some(checked_at.saturating_add(self.ttl)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{Review, Status};
+    use super::*;
+
+    fn policy(version: &str) -> crate::policy::Policy {
+        let document = json!({"format":"filtr-1","packages":[{"purl":format!("pkg:maven/org.apache.logging.log4j/log4j-core@{version}")}]});
+        crate::policy::Policy::compile(
+            crate::sbom::parse(document.to_string().as_bytes()).unwrap(),
+            &crate::policy::Catalog::bundled().unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn identical_components_share_one_review_and_remap_all_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache.json");
+        let config = AiConfig::default();
+        let mut policy = policy("2.14.1");
+        policy
+            .report
+            .components
+            .push(policy.report.components[0].clone());
+        let mut store = Store::load(&path, &config, ReviewTrigger::Startup)
+            .await
+            .unwrap();
+        let mut stats = Stats::default();
+        store.reuse(&policy.report, &mut stats).unwrap();
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.deduplicated_components, 1);
+        let reply = serde_json::from_value(
+            json!({"summary":"Reviewed.","enhancements":[],"discoveries":[]}),
+        )
+        .unwrap();
+        let mut replies = vec![ReviewedBatch {
+            batch: batches::cached(&policy.report, 0),
+            reply,
+            target: Target::backup(),
+        }];
+        store.expand_aliases(&policy.report, &mut replies);
+        assert_eq!(replies.len(), 2);
+        assert!(replies[1].batch.includes_component(1));
+        store
+            .finish(
+                &path,
+                &replies,
+                &mut Review {
+                    status: Status::Complete,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_eq!(store.data.entries.len(), 1);
+        let mut loaded = Store::load(&path, &config, ReviewTrigger::Startup)
+            .await
+            .unwrap();
+        assert_eq!(
+            loaded
+                .reuse(&policy.report, &mut Stats::default())
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_entries_expire_and_invalidate_for_changed_versions_rules_and_models() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache.json");
+        let config = AiConfig::default();
+        assert_eq!(config.cache_ttl_secs, 86400);
+        let policy = policy("2.14.1");
+        let mut store = Store::load(&path, &config, ReviewTrigger::Startup)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .reuse(&policy.report, &mut Stats::default())
+                .unwrap()
+                .is_empty()
+        );
+        let reply = serde_json::from_value(
+            json!({"summary":"No additional finding.","enhancements":[],"discoveries":[]}),
+        )
+        .unwrap();
+        let replies = vec![ReviewedBatch {
+            batch: batches::cached(&policy.report, 0),
+            reply,
+            target: Target::backup(),
+        }];
+        store
+            .finish(
+                &path,
+                &replies,
+                &mut Review {
+                    status: Status::Complete,
+                    ..Default::default()
+                },
+            )
+            .await;
+        let mut loaded = Store::load(&path, &config, ReviewTrigger::Startup)
+            .await
+            .unwrap();
+        assert_eq!(
+            loaded
+                .reuse(&policy.report, &mut Stats::default())
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut patched = policy.clone();
+        patched.report.components[0].component.version = Some("2.14.2".into());
+        assert!(
+            Store::load(&path, &config, ReviewTrigger::Startup)
+                .await
+                .unwrap()
+                .reuse(&patched.report, &mut Stats::default())
+                .unwrap()
+                .is_empty()
+        );
+        let mut changed = policy.clone();
+        changed.report.active_rules[0]
+            .description
+            .push_str(" Changed mitigation.");
+        assert!(
+            Store::load(&path, &config, ReviewTrigger::Startup)
+                .await
+                .unwrap()
+                .reuse(&changed.report, &mut Stats::default())
+                .unwrap()
+                .is_empty()
+        );
+        let other_model = AiConfig {
+            model: Some("openai/another-model".into()),
+            ..config.clone()
+        };
+        assert!(
+            Store::load(&path, &other_model, ReviewTrigger::Startup)
+                .await
+                .unwrap()
+                .reuse(&policy.report, &mut Stats::default())
+                .unwrap()
+                .is_empty()
+        );
+        let entry = loaded.data.entries.values_mut().next().unwrap();
+        entry.checked_at = now().unwrap() - 86400;
+        std::fs::write(&path, serde_json::to_vec(&loaded.data).unwrap()).unwrap();
+        assert!(
+            Store::load(&path, &config, ReviewTrigger::Startup)
+                .await
+                .unwrap()
+                .reuse(&policy.report, &mut Stats::default())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupted_cache_requires_explicit_clear_and_partial_reviews_are_not_cached() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache.json");
+        std::fs::write(&path, "bad cache").unwrap();
+        let config = AiConfig::default();
+        assert!(
+            Store::load(&path, &config, ReviewTrigger::Startup)
+                .await
+                .is_err()
+        );
+        let mut store = Store::load(&path, &config, ReviewTrigger::Refresh)
+            .await
+            .unwrap();
+        assert!(!path.exists());
+        let policy = policy("2.14.1");
+        store.reuse(&policy.report, &mut Stats::default()).unwrap();
+        store
+            .finish(
+                &path,
+                &[],
+                &mut Review {
+                    status: Status::Partial,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(!path.exists());
+    }
+}

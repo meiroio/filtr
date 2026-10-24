@@ -2,7 +2,7 @@
 
 pub mod ai;
 pub mod generated;
-pub mod osv;
+mod network;
 pub mod policy;
 mod proxy;
 pub mod sbom;
@@ -55,11 +55,6 @@ pub struct Config {
     /// Replace the bundled catalogue with a local JSON catalogue.
     #[arg(long, env = "FILTR_RULES")]
     pub rules: Option<PathBuf>,
-    #[arg(long, env = "FILTR_OSV_URL", default_value = "https://api.osv.dev/")]
-    pub osv_url: reqwest::Url,
-    /// Total deadline for the complete SBOM vulnerability scan.
-    #[arg(long, env = "FILTR_OSV_TIMEOUT_SECS", default_value_t = 600)]
-    pub osv_timeout_secs: u64,
     #[command(flatten)]
     pub ai: ai::AiConfig,
     #[arg(long, default_value_t = 1_048_576)]
@@ -72,7 +67,6 @@ pub struct Config {
 
 impl Config {
     pub fn validate(&self) -> Result<()> {
-        osv::validate_config(&self.osv_url, self.osv_timeout_secs)?;
         self.ai.validate()?;
         ensure!(
             self.admin_listen.ip().is_loopback(),
@@ -140,7 +134,6 @@ pub struct AppState {
     catalog: Catalog,
     policy: ArcSwapOption<Policy>,
     client: reqwest::Client,
-    osv: osv::Client,
     ai: ai::Client,
     counters: Counters,
     requests: Arc<Semaphore>,
@@ -164,12 +157,10 @@ impl AppState {
             Some(path) => Catalog::parse(&read_bounded(path)?)?,
             None => Catalog::bundled()?,
         };
-        let osv = osv::Client::new(config.osv_url.clone(), config.osv_timeout_secs)?;
         let ai = ai::Client::new(config.ai.clone(), &config.sbom)?;
         let policy = match read_bounded(&config.sbom) {
             Ok(bytes) => {
                 let mut policy = Policy::compile(sbom::parse(&bytes)?, &catalog)?;
-                policy.report.osv = osv.scan(&policy.report).await;
                 ai.enhance(&mut policy, ai::ReviewTrigger::Startup).await;
                 Some(Arc::new(policy))
             }
@@ -190,18 +181,81 @@ impl AppState {
             .timeout(Duration::from_secs(config.timeout_secs))
             .pool_max_idle_per_host(config.max_in_flight)
             .build()?;
-        Ok(Arc::new(Self {
+        let state = Arc::new(Self {
             requests: Arc::new(Semaphore::new(config.max_in_flight)),
             admin_requests: Arc::new(Semaphore::new(8)),
             config,
             catalog,
             client,
-            osv,
             ai,
             policy: ArcSwapOption::from(policy),
             counters: Counters::default(),
             updates: Arc::new(Mutex::new(())),
-        }))
+        });
+        schedule_refresh(&state);
+        Ok(state)
+    }
+}
+
+fn schedule_refresh(state: &Arc<AppState>) {
+    let state = Arc::downgrade(state);
+    tokio::spawn(async move {
+        let mut timer = tokio::time::interval(Duration::from_secs(1));
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            timer.tick().await;
+            let Some(state) = state.upgrade() else { break };
+            let due = state
+                .policy
+                .load_full()
+                .is_some_and(|policy| state.ai.refresh_due(&policy));
+            if !due {
+                continue;
+            }
+            let Ok(guard) = state.updates.clone().try_lock_owned() else {
+                continue;
+            };
+            if let Err(error) = reanalyze(state, guard, ai::ReviewTrigger::Expired).await {
+                tracing::error!(error = %error, "automatic AI refresh failed");
+            }
+        }
+    });
+}
+
+async fn reanalyze(
+    state: Arc<AppState>,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+    trigger: ai::ReviewTrigger,
+) -> Result<Arc<Policy>> {
+    let current = state
+        .policy
+        .load_full()
+        .context("an SBOM must be installed before refresh")?;
+    let components = current
+        .report
+        .components
+        .iter()
+        .map(|item| item.component.clone())
+        .collect();
+    let mut policy = Policy::compile(components, &state.catalog)?;
+    policy.report.ai = state.ai.pending_review();
+    state.policy.store(Some(Arc::new(policy.clone())));
+    state.ai.enhance(&mut policy, trigger).await;
+    let policy = Arc::new(policy);
+    state.policy.store(Some(policy.clone()));
+    Ok(policy)
+}
+
+async fn refresh(State(state): State<Arc<AppState>>) -> Response {
+    let Ok(guard) = state.updates.clone().try_lock_owned() else {
+        return error(StatusCode::CONFLICT, "sbom-update-in-progress");
+    };
+    if state.policy.load_full().is_none() {
+        return error(StatusCode::CONFLICT, "sbom-required");
+    }
+    match tokio::spawn(reanalyze(state, guard, ai::ReviewTrigger::Refresh)).await {
+        Ok(Ok(policy)) => Json(json!({"ready":true,"policy":policy.report})).into_response(),
+        _ => error(StatusCode::INTERNAL_SERVER_ERROR, "refresh-failed"),
     }
 }
 
@@ -216,6 +270,7 @@ pub fn routers(state: Arc<AppState>) -> (Router, Router) {
         .route("/v1/status", get(status))
         .route("/v1/rules", get(rules))
         .route("/v1/sbom", post(upload))
+        .route("/v1/refresh", post(refresh))
         .layer(middleware::from_fn_with_state(state.clone(), admin_gate))
         .with_state(state);
     (public, admin)
@@ -337,8 +392,6 @@ async fn install(
         active_rules = policy.report.active_rules.len(),
         "SBOM policy activated"
     );
-    policy.report.osv = state.osv.scan(&policy.report).await;
-    tracing::info!(status = policy.report.osv.status, "OSV scan finished");
     policy.report.ai = state.ai.pending_review();
     state.policy.store(Some(Arc::new(policy.clone())));
     state

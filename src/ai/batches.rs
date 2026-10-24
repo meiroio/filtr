@@ -2,16 +2,22 @@ use super::Proposal;
 use crate::policy::Report;
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 pub(super) const MAX_INPUT_BYTES: usize = 128 * 1024;
 
+#[derive(Clone)]
 pub(super) struct Batch {
     pub input: String,
     bases: BTreeSet<(usize, String)>,
+    components: BTreeSet<usize>,
 }
 
 impl Batch {
+    pub fn includes_component(&self, index: usize) -> bool {
+        self.components.contains(&index)
+    }
+
     pub fn includes(&self, proposal: &Proposal) -> bool {
         self.bases
             .contains(&(proposal.component_index, proposal.basis.clone()))
@@ -37,77 +43,68 @@ impl Pending {
         let input = serde_json::to_string(&self.input)?;
         ensure!(input.len() <= MAX_INPUT_BYTES, "AI batch exceeds 128 KiB");
         Ok(Batch {
+            components: self.input["components"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|c| c["component_index"].as_u64().map(|i| i as usize))
+                .collect(),
             input,
             bases: self.bases,
         })
     }
 }
 
+#[cfg(test)]
 pub(super) fn plan(report: &Report) -> Result<Vec<Batch>> {
-    let packages: BTreeMap<_, _> = report
-        .osv
-        .packages
-        .iter()
-        .map(|p| ((p.package.as_str(), p.version.as_str()), p))
-        .collect();
-    let envelope = json!({"total_components":report.components.len(), "components":[], "findings":[], "curated_rules":report.active_rules, "osv_status":report.osv.status, "osv_summary":report.osv.summary});
+    plan_missing(report, &(0..report.components.len()).collect())
+}
+
+pub(super) fn cached(report: &Report, index: usize) -> Batch {
+    Batch {
+        input: String::new(),
+        components: [index].into(),
+        bases: report.components[index]
+            .active_rules
+            .iter()
+            .map(|id| (index, id.clone()))
+            .collect(),
+    }
+}
+
+pub(super) fn plan_missing(report: &Report, missing: &BTreeSet<usize>) -> Result<Vec<Batch>> {
+    let envelope = json!({"total_components":report.components.len(), "components":[], "curated_rules":report.active_rules});
     let mut pending = Pending::new(&envelope)?;
     let mut batches = Vec::new();
-    for (index, item) in report.components.iter().enumerate() {
+    for &index in missing {
+        let item = &report.components[index];
         let mut component = serde_json::to_value(item)?;
         component["component_index"] = json!(index);
-        let package = item
-            .component
-            .package
-            .as_deref()
-            .zip(item.component.version.as_deref())
-            .and_then(|key| packages.get(&key).copied());
-        for finding in evidence(package) {
-            let bytes =
-                serde_json::to_vec(&component)?.len() + serde_json::to_vec(&finding)?.len() + 2;
-            if pending.bytes + bytes > MAX_INPUT_BYTES
-                && !pending.input["components"].as_array().unwrap().is_empty()
-            {
-                batches.push(pending.finish()?);
-                pending = Pending::new(&envelope)?;
-            }
-            ensure!(
-                pending.bytes + bytes <= MAX_INPUT_BYTES,
-                "one AI evidence item exceeds 128 KiB"
-            );
-            pending.bytes += bytes;
-            pending
-                .bases
-                .extend(item.active_rules.iter().map(|id| (index, id.clone())));
-            if let Some(id) = finding["vulnerabilities"][0]["id"].as_str() {
-                pending.bases.insert((index, id.to_owned()));
-            }
-            pending.input["components"]
-                .as_array_mut()
-                .unwrap()
-                .push(component.clone());
-            pending.input["findings"]
-                .as_array_mut()
-                .unwrap()
-                .push(finding);
+        let bytes = serde_json::to_vec(&component)?.len() + 1;
+        if pending.bytes + bytes > MAX_INPUT_BYTES
+            && !pending.input["components"].as_array().unwrap().is_empty()
+        {
+            batches.push(pending.finish()?);
+            pending = Pending::new(&envelope)?;
         }
+        ensure!(
+            pending.bytes + bytes <= MAX_INPUT_BYTES,
+            "one AI component exceeds 128 KiB"
+        );
+        pending.bytes += bytes;
+        pending
+            .bases
+            .extend(item.active_rules.iter().map(|id| (index, id.clone())));
+        pending.input["components"]
+            .as_array_mut()
+            .unwrap()
+            .push(component);
     }
     if !pending.input["components"].as_array().unwrap().is_empty() {
         batches.push(pending.finish()?);
     }
-    ensure!(
-        !batches.is_empty() && batches.len() <= 512,
-        "AI review exceeds 512 batches"
-    );
+    ensure!(batches.len() <= 512, "AI review exceeds 512 batches");
     Ok(batches)
-}
-
-fn evidence(package: Option<&crate::osv::PackageFindings>) -> Vec<Value> {
-    match package {
-        Some(p) if !p.vulnerabilities.is_empty() => p.vulnerabilities.iter().map(|v| json!({"package":p.package,"version":p.version,"status":p.status,"error":p.error,"vulnerabilities":[v]})).collect(),
-        Some(p) => vec![json!({"package":p.package,"version":p.version,"status":p.status,"error":p.error,"vulnerabilities":[]})],
-        None => vec![json!({"status":"skipped","vulnerabilities":[]})],
-    }
 }
 
 #[cfg(test)]

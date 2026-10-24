@@ -27,6 +27,6 @@ services:
     depends_on: [origin]
     stop_grace_period: 30s
     healthcheck:
-      start_period: 1560s
+      start_period: 960s
 volumes:
   filtr-data:
