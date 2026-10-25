@@ -506,9 +506,13 @@ impl Policy {
     }
 
     fn scan(&self, bytes: &[u8], target: bool) -> Option<&str> {
-        if bytes.contains(&0) {
+        if memchr::memchr(0, bytes).is_some() {
             return Some("nul-byte");
         }
+        self.scan_content(bytes, target)
+    }
+
+    fn scan_content(&self, bytes: &[u8], target: bool) -> Option<&str> {
         if target
             && [b"../".as_slice(), b"..\\", b"/.git", b"/.env"]
                 .iter()
@@ -528,11 +532,14 @@ impl Policy {
 
     /// Raw and decoded views are inspected; the original bytes are always forwarded.
     pub fn inspect_bytes(&self, bytes: &[u8], target: bool) -> Option<&str> {
+        match memchr::memchr3(0, b'%', b'\\', bytes).map(|index| bytes[index]) {
+            // One pass proves the clean view needs neither the NUL check nor decoding.
+            None => return self.scan_content(bytes, target),
+            Some(0) => return Some("nul-byte"),
+            _ => {}
+        }
         if let Some(rule) = self.scan(bytes, target) {
             return Some(rule);
-        }
-        if !bytes.contains(&b'%') && !bytes.contains(&b'\\') {
-            return None;
         }
         let mut current = bytes.to_vec();
         for _ in 0..4 {
@@ -553,7 +560,7 @@ fn decoded_views(bytes: &[u8]) -> Vec<Cow<'_, [u8]>> {
     let mut views = vec![Cow::Borrowed(bytes)];
     for _ in 0..4 {
         let Some(previous) = views.last() else { break };
-        if !previous.contains(&b'%') && !previous.contains(&b'\\') {
+        if memchr::memchr2(b'%', b'\\', previous).is_none() {
             break;
         }
         let decoded = decode(previous);
@@ -755,6 +762,28 @@ mod tests {
             policy.inspect_bytes(b"%252525252541", false),
             Some("encoding-depth")
         );
+    }
+
+    #[test]
+    fn byte_search_preserves_guards_at_vector_and_large_body_boundaries() {
+        let policy = log4j("2.14.1");
+        for offset in (0..=128).chain([1023, 65535]) {
+            for (marker, expected) in [
+                (b"".as_slice(), None),
+                (b"\0".as_slice(), Some("nul-byte")),
+                (b"${jndi:x}\0", Some("nul-byte")),
+                (b"%24%7Bjndi:x}\0", Some("nul-byte")),
+                (b"%00", Some("nul-byte")),
+                (b"%2524%257Bjndi:x%257D", Some("log4shell-lookups")),
+                (br"\u0024\u007bjndi:x}", Some("log4shell-lookups")),
+                (b"%252525252541", Some("encoding-depth")),
+                (br"%zz\q", None),
+            ] {
+                let mut payload = vec![b'a'; offset];
+                payload.extend_from_slice(marker);
+                assert_eq!(policy.inspect_bytes(&payload, false), expected, "{offset}");
+            }
+        }
     }
 
     #[test]

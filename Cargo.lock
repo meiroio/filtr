@@ -352,6 +352,7 @@ dependencies = [
  "clap",
  "dotenvy",
  "futures-util",
+ "memchr",
  "packageurl",
  "reqwest",
  "semver",

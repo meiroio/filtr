@@ -2,7 +2,7 @@ use crate::{AppState, block, error};
 use axum::{
     body::{Body, to_bytes},
     extract::{ConnectInfo, Request, State},
-    http::{HeaderMap, HeaderName, Method, StatusCode, header},
+    http::{HeaderMap, HeaderName, Method, StatusCode, Uri, header},
     response::Response,
 };
 use futures_util::StreamExt;
@@ -14,17 +14,17 @@ use std::{
 
 const MAX_HEADER_BYTES: usize = 32 * 1024;
 const MAX_TARGET_BYTES: usize = 8 * 1024;
-const HOP_HEADERS: &[&str] = &[
-    "connection",
-    "proxy-connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-    "http2-settings",
+static HOP_HEADERS: [HeaderName; 10] = [
+    HeaderName::from_static("connection"),
+    HeaderName::from_static("proxy-connection"),
+    HeaderName::from_static("keep-alive"),
+    HeaderName::from_static("proxy-authenticate"),
+    HeaderName::from_static("proxy-authorization"),
+    HeaderName::from_static("te"),
+    HeaderName::from_static("trailer"),
+    HeaderName::from_static("transfer-encoding"),
+    HeaderName::from_static("upgrade"),
+    HeaderName::from_static("http2-settings"),
 ];
 
 fn strip_hop_headers(headers: &mut HeaderMap) {
@@ -38,22 +38,23 @@ fn strip_hop_headers(headers: &mut HeaderMap) {
     for name in nominated {
         headers.remove(name);
     }
-    for name in HOP_HEADERS {
-        headers.remove(*name);
+    for name in &HOP_HEADERS {
+        headers.remove(name);
     }
 }
 
 fn unsafe_envelope(request: &Request) -> Option<(StatusCode, &'static str)> {
     let uri = request.uri();
+    let target = uri.path_and_query().map_or("/", |value| value.as_str());
     let headers = request.headers();
     if uri.scheme().is_some()
         || uri.authority().is_some()
         || !uri.path().starts_with('/')
-        || uri.to_string().contains(['#', '\\'])
+        || target.contains(['#', '\\'])
     {
         return Some((StatusCode::BAD_REQUEST, "invalid-request-target"));
     }
-    if uri.to_string().len() > MAX_TARGET_BYTES {
+    if target.len() > MAX_TARGET_BYTES {
         return Some((StatusCode::URI_TOO_LONG, "target-too-large"));
     }
     if headers
@@ -118,6 +119,14 @@ fn unsafe_envelope(request: &Request) -> Option<(StatusCode, &'static str)> {
         return Some((StatusCode::BAD_REQUEST, "chunked-request-not-supported"));
     }
     None
+}
+
+fn upstream_url(origin: &reqwest::Url, uri: &Uri) -> reqwest::Url {
+    // Path/query setters cannot replace the configured authority, even for //host paths.
+    let mut url = origin.clone();
+    url.set_path(uri.path());
+    url.set_query(uri.query());
+    url
 }
 
 pub(crate) async fn forward(
@@ -212,28 +221,16 @@ pub(crate) async fn forward(
     if let Some(rule) = policy.inspect_bytes(&bytes, false) {
         return block(&state, StatusCode::FORBIDDEN, rule);
     }
-    // Prefixing the configured origin avoids URL-join authority overrides (//host).
-    let url = match reqwest::Url::parse(&format!(
-        "{}{}",
-        state.config.upstream.origin().ascii_serialization(),
-        target
-    )) {
-        Ok(url) if url.origin() == state.config.upstream.origin() => url,
-        _ => return block(&state, StatusCode::BAD_REQUEST, "invalid-upstream-target"),
-    };
+    let url = upstream_url(&state.config.upstream, &parts.uri);
     let mut headers = parts.headers;
     strip_hop_headers(&mut headers);
     headers.remove(header::CONTENT_LENGTH);
     metadata.apply(&mut headers);
     state.counters.proxied.fetch_add(1, Ordering::Relaxed);
-    let upstream = match state
-        .client
-        .request(parts.method, url)
-        .headers(headers)
-        .body(bytes)
-        .send()
-        .await
-    {
+    let mut request = reqwest::Request::new(parts.method, url);
+    *request.headers_mut() = headers;
+    *request.body_mut() = Some(bytes.into());
+    let mut upstream = match state.client.execute(request).await {
         Ok(response) => response,
         Err(upstream_error) => {
             state
@@ -257,7 +254,7 @@ pub(crate) async fn forward(
         return error(StatusCode::BAD_GATEWAY, "unexpected-upstream-upgrade");
     }
     let status = upstream.status();
-    let mut headers = upstream.headers().clone();
+    let mut headers = std::mem::take(upstream.headers_mut());
     strip_hop_headers(&mut headers);
     let stream = upstream.bytes_stream().map(move |result| {
         if result.is_err() {
@@ -273,4 +270,48 @@ pub(crate) async fn forward(
     *response.status_mut() = status;
     *response.headers_mut() = headers;
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upstream_setters_preserve_serialization_and_fixed_authority() {
+        let mut targets = vec![
+            "/".to_owned(),
+            "//elsewhere.invalid:81/path?x=1".to_owned(),
+            "///elsewhere.invalid/path".to_owned(),
+            "/https://elsewhere.invalid/path".to_owned(),
+            "/a%2Fb/%25/%E2%82%AC?x=a%2Fb&y=+%25".to_owned(),
+            "/empty?".to_owned(),
+            "/a/./b/../c?x=../value".to_owned(),
+        ];
+        targets.extend(
+            (b'!'..=b'~')
+                .filter(|byte| !b"#\\".contains(byte))
+                .map(|byte| format!("/segment{}tail?x=%2F&y=+%25", char::from(byte))),
+        );
+        for origin in [
+            "http://127.0.0.1:3000",
+            "https://example.com",
+            "http://[::1]:8081",
+        ] {
+            let origin = reqwest::Url::parse(origin).unwrap();
+            for target in &targets {
+                let Ok(uri) = target.parse::<Uri>() else {
+                    continue;
+                };
+                let expected = reqwest::Url::parse(&format!(
+                    "{}{}",
+                    origin.origin().ascii_serialization(),
+                    uri
+                ))
+                .unwrap();
+                let actual = upstream_url(&origin, &uri);
+                assert_eq!(actual.origin(), origin.origin(), "{target}");
+                assert_eq!(actual, expected, "{target}");
+            }
+        }
+    }
 }

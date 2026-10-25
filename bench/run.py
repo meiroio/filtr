@@ -14,45 +14,49 @@ import time
 
 
 ROOT = Path(__file__).resolve().parent.parent
+BASELINE_IMAGE = "ghcr.io/meiroio/filtr:0.1.0@sha256:5333b0a0101a08ee902c90e68bc36fa44eba1ec9948be050f65648837a52bc03"
 
 
 def command(args, *, prefix=(), **kwargs):
-    return subprocess.run([*prefix, *args], check=True, text=True, capture_output=True, **kwargs).stdout
+    result = subprocess.run([*prefix, *args], text=True, capture_output=True, **kwargs)
+    if result.returncode:
+        raise RuntimeError(f"Benchmark command failed ({result.returncode}): {result.stderr[-2000:]}")
+    return result.stdout
 
 
-def api(compose, path, upload=False):
+def api(compose, path, upload=False, service="filtr"):
     body = " --data-binary @/data/candidate.json -H 'Content-Type: application/json'" if upload else ""
     script = (
         'printf \'header = "Authorization: Bearer %s"\\n\' "$FILTR_ADMIN_TOKEN" | '
         "curl --config - --noproxy '*' --fail --silent --show-error --max-time 15 "
         f"http://127.0.0.1:9090{path}{body}"
     )
-    return json.loads(compose(["exec", "-T", "filtr", "sh", "-ec", script]))
+    return json.loads(compose(["exec", "-T", service, "sh", "-ec", script]))
 
 
-def install_policy(compose):
+def install_policy(compose, service="filtr"):
     for _ in range(75):
         try:
-            compose(["exec", "-T", "filtr", "filtr-probe", "live"])
+            compose(["exec", "-T", service, "filtr-probe", "live"])
             break
-        except subprocess.CalledProcessError:
+        except RuntimeError:
             time.sleep(0.2)
     else:
         raise RuntimeError("Filtr did not start within 15 seconds")
     fixture = (ROOT / "examples/sbom.cdx.json").read_text()
-    compose(["exec", "-T", "filtr", "sh", "-ec", "cat > /data/candidate.json"], input=fixture)
-    api(compose, "/v1/sbom", upload=True)
-    compose(["exec", "-T", "filtr", "filtr-probe", "ready"])
+    compose(["exec", "-T", service, "sh", "-ec", "cat > /data/candidate.json"], input=fixture)
+    api(compose, "/v1/sbom", upload=True, service=service)
+    compose(["exec", "-T", service, "filtr-probe", "ready"])
     payload = '{"data":"' + "a" * (65536 - 11) + '"}'
-    compose(["exec", "-T", "filtr", "sh", "-ec", "cat > /data/body.json"], input=payload)
+    compose(["exec", "-T", service, "sh", "-ec", "cat > /data/body.json"], input=payload)
     response = json.loads(compose([
-        "exec", "-T", "filtr", "curl", "--noproxy", "*", "--fail", "--silent", "--show-error",
+        "exec", "-T", service, "curl", "--noproxy", "*", "--fail", "--silent", "--show-error",
         "-H", "Content-Type: application/json", "--data-binary", "@/data/body.json",
         "http://127.0.0.1:8080/bench",
     ]))
     if response.get("body_bytes") != 65536:
         raise RuntimeError("Preflight did not forward the complete request body")
-    status = api(compose, "/v1/status")
+    status = api(compose, "/v1/status", service=service)
     if status["policy"]["ai"]["status"] != "not_configured":
         raise RuntimeError("Benchmark must run without AI credentials")
     return status
@@ -94,6 +98,13 @@ def measure(compose, args, output):
         ("filtr_post_64k", "filtr:8080", [*post, "/input/body-65536.json"], 200),
         ("filtr_block", "filtr:8080", ["-H", "X-Test: ${jndi:ldap://example.invalid/test}"], 403),
     ]
+    if args.baseline_image:
+        comparison = []
+        for name, target, extra, expected in workloads:
+            if name.startswith("filtr_"):
+                comparison.append((name.replace("filtr_", "baseline_", 1), "baseline:8080", extra, expected))
+            comparison.append((name, target, extra, expected))
+        workloads = comparison
     runs = {w[0]: [] for w in workloads}
     for workload in workloads:
         load(compose, workload, args.warmup, args.connections)
@@ -107,24 +118,34 @@ def measure(compose, args, output):
 
 
 def execute(args, output, input_dir):
-    env = dict(os.environ, FILTR_ADMIN_TOKEN=secrets.token_hex(64), FILTR_BENCH_INPUT=str(input_dir))
+    env = dict(os.environ, FILTR_ADMIN_TOKEN=secrets.token_hex(64), FILTR_BENCH_INPUT=str(input_dir),
+               FILTR_BENCH_IMAGE=args.image, FILTR_BENCH_BASELINE_IMAGE=args.baseline_image or BASELINE_IMAGE)
     # Compose receives only explicitly declared container variables. Never load the project's .env.
     compose = ["docker", "compose", "--env-file", "/dev/null", "--project-name",
                f"filtr-bench-{secrets.token_hex(4)}", "--file", str(ROOT / "bench/compose.yaml")]
     compose = functools.partial(command, prefix=compose, env=env)
     try:
-        print("Building benchmark tools and demo origin; pulling the published Filtr image", flush=True)
+        print("Building benchmark tools and demo origin; starting the selected Filtr image", flush=True)
         (output / "build.log").write_text(compose(["build", "origin", "loadgen"]))
-        compose(["up", "--detach", "origin", "filtr"])
+        compose(["up", "--detach", "origin", "filtr", *(["baseline"] if args.baseline_image else [])])
         policy = install_policy(compose)
+        baseline = install_policy(compose, "baseline") if args.baseline_image else None
         before = policy["counters"]
         results = measure(compose, args, output)
         after = api(compose, "/v1/status")
         if after["counters"]["upstream_errors"] != 0:
             raise RuntimeError("Upstream errors invalidate this benchmark")
+        comparison = None
+        if baseline:
+            baseline_after = api(compose, "/v1/status", service="baseline")
+            if baseline_after["counters"]["upstream_errors"] != 0:
+                raise RuntimeError("Baseline upstream errors invalidate this benchmark")
+            comparison = {"counters_before": baseline["counters"],
+                          "counters_after": baseline_after["counters"],
+                          "ai_status": baseline_after["policy"]["ai"]["status"]}
         return {"results": results, "counters_before": before, "counters_after": after["counters"],
                 "ai_status": after["policy"]["ai"]["status"],
-                "active_rules": policy["policy"]["active_rules"]}
+                "active_rules": policy["policy"]["active_rules"], "comparison_baseline": comparison}
     finally:
         compose(["down", "--volumes", "--remove-orphans"])
 
@@ -136,6 +157,8 @@ def main():
     parser.add_argument("--connections", type=int, default=64)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--host-description", default="unspecified")
+    parser.add_argument("--image", default=BASELINE_IMAGE, help="Filtr image to measure")
+    parser.add_argument("--baseline-image", help="Also measure this Filtr image, alternating each workload pair")
     parser.add_argument("--output", type=Path, default=ROOT / "data/benchmark")
     args = parser.parse_args()
     if min(args.duration, args.repeats, args.connections, args.warmup) < 1:
@@ -146,7 +169,9 @@ def main():
         input_dir = Path(temporary)
         input_dir.chmod(0o755)
         for size in (1024, 65536):
-            (input_dir / f"body-{size}.json").write_bytes(b'{"data":"' + b"a" * (size - 11) + b'"}')
+            payload = input_dir / f"body-{size}.json"
+            payload.write_bytes(b'{"data":"' + b"a" * (size - 11) + b'"}')
+            payload.chmod(0o644)
         result = execute(args, output, input_dir)
     result["setup"] = {"recorded_at": datetime.now(timezone.utc).isoformat(),
                        "duration_seconds": args.duration, "repeats": args.repeats,
@@ -157,7 +182,10 @@ def main():
                            '"cpus":{{.NCPU}},"memory_bytes":{{.MemTotal}}}'])),
                        "source_revision": command(["git", "-C", str(ROOT), "rev-parse", "HEAD"]).strip(),
                        "source_dirty": bool(command(["git", "-C", str(ROOT), "status", "--porcelain"])),
-                       "image": "ghcr.io/meiroio/filtr:0.1.0@sha256:5333b0a0101a08ee902c90e68bc36fa44eba1ec9948be050f65648837a52bc03",
+                       "image": args.image,
+                       "baseline_image": args.baseline_image,
+                       "baseline_image_id": command(["docker", "image", "inspect", args.baseline_image, "--format", "{{.Id}}"]).strip() if args.baseline_image else None,
+                       "image_id": command(["docker", "image", "inspect", args.image, "--format", "{{.Id}}"]).strip(),
                        "load_generator": "oha 1.16.0"}
     (output / "summary.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result["results"], indent=2), flush=True)
