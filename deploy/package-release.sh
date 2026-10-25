@@ -18,10 +18,14 @@ mkdir "$temporary/package/simple"
 cp "$repository"/deploy/simple/*.py "$temporary/package/simple/"
 cp "$repository/LICENSE" "$temporary/package/LICENSE"
 cp "$repository/README.md" "$temporary/package/README.md"
+cp "$repository/filtr.png" "$temporary/package/filtr.png"
+cp "$repository/.env.example" "$temporary/package/.env.example"
+mkdir "$temporary/package/docs"
+cp "$repository"/docs/*.md "$temporary/package/docs/"
 chmod 755 "$temporary/package/filtr" "$temporary/package/filtr-install"
 cd "$temporary/package"
 # No application-specific inventories, secrets or local reports enter this archive.
-sha256sum filtr filtr-install simple/*.py LICENSE README.md > SHA256SUMS
+sha256sum filtr filtr-install simple/*.py docs/*.md LICENSE README.md filtr.png .env.example > SHA256SUMS
 python3 - "$output/filtr-$version-linux-$architecture.tar.gz" <<'PY'
 import sys
 import tarfile
@@ -35,7 +39,7 @@ def public_metadata(info):
     return info
 
 with tarfile.open(sys.argv[1], "w:gz") as archive:
-    for name in ("filtr", "filtr-install", "simple", "LICENSE", "README.md", "SHA256SUMS"):
+    for name in ("filtr", "filtr-install", "simple", "docs", "LICENSE", "README.md", "filtr.png", ".env.example", "SHA256SUMS"):
         archive.add(name, arcname=name, filter=public_metadata)
 PY
 cd "$output"

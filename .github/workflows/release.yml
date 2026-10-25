@@ -24,6 +24,9 @@ jobs:
           ARCH: ${{ matrix.architecture }}
         run: sh deploy/package-release.sh "$VERSION" "$ARCH" dist
       - name: Smoke test archive
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           mkdir smoke
           tar -xzf dist/*.tar.gz -C smoke
@@ -31,6 +34,9 @@ jobs:
           sha256sum -c SHA256SUMS
           ./filtr --version
           ./filtr-install --help
+          if [ "$REF_TYPE" = tag ]; then
+            test "$(./filtr --version)" = "filtr ${REF_NAME#v}"
+          fi
       - name: Apache/PHP integration and rollback
         run: sh tests/simple/run.sh dist
       - name: Node/Express integration and rollback
@@ -46,6 +52,7 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           pattern: filtr-linux-*
@@ -56,4 +63,4 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ github.ref_name }}
-        run: gh release create "$VERSION" dist/* --title "Filtr $VERSION" --generate-notes
+        run: gh release create "$VERSION" dist/* --verify-tag --title "Filtr $VERSION" --notes-file .github/release-notes.md
