@@ -22,7 +22,7 @@ pub(super) async fn request(
         if target.provider == Provider::Anthropic && response["stop_reason"] == "pause_turn" {
             body["messages"]
                 .as_array_mut()
-                .unwrap()
+                .context("AI request messages must be an array")?
                 .push(json!({"role":"assistant", "content":response["content"]}));
             continue;
         }
@@ -166,10 +166,12 @@ fn request_body(target: &Target, input: &str) -> Value {
             "messages":[{"role":"user", "content":input}]
         }),
     };
-    if matches!(target.reasoning.as_str(), "default" | "none") {
-        body.as_object_mut().unwrap().remove("reasoning");
-        body.as_object_mut().unwrap().remove("thinking");
-        body.as_object_mut().unwrap().remove("output_config");
+    if matches!(target.reasoning.as_str(), "default" | "none")
+        && let Some(object) = body.as_object_mut()
+    {
+        object.remove("reasoning");
+        object.remove("thinking");
+        object.remove("output_config");
     }
     body
 }

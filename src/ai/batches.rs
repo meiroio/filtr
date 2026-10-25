@@ -1,6 +1,6 @@
 use super::Proposal;
 use crate::policy::Report;
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
@@ -10,7 +10,7 @@ pub(super) const MAX_INPUT_BYTES: usize = 128 * 1024;
 pub(super) struct Batch {
     pub input: String,
     bases: BTreeSet<(usize, String)>,
-    components: BTreeSet<usize>,
+    pub(super) components: BTreeSet<usize>,
 }
 
 impl Batch {
@@ -45,7 +45,7 @@ impl Pending {
         Ok(Batch {
             components: self.input["components"]
                 .as_array()
-                .unwrap()
+                .context("AI batch components must be an array")?
                 .iter()
                 .filter_map(|c| c["component_index"].as_u64().map(|i| i as usize))
                 .collect(),
@@ -82,7 +82,10 @@ pub(super) fn plan_missing(report: &Report, missing: &BTreeSet<usize>) -> Result
         component["component_index"] = json!(index);
         let bytes = serde_json::to_vec(&component)?.len() + 1;
         if pending.bytes + bytes > MAX_INPUT_BYTES
-            && !pending.input["components"].as_array().unwrap().is_empty()
+            && !pending.input["components"]
+                .as_array()
+                .context("AI batch components must be an array")?
+                .is_empty()
         {
             batches.push(pending.finish()?);
             pending = Pending::new(&envelope)?;
@@ -97,10 +100,14 @@ pub(super) fn plan_missing(report: &Report, missing: &BTreeSet<usize>) -> Result
             .extend(item.active_rules.iter().map(|id| (index, id.clone())));
         pending.input["components"]
             .as_array_mut()
-            .unwrap()
+            .context("AI batch components must be an array")?
             .push(component);
     }
-    if !pending.input["components"].as_array().unwrap().is_empty() {
+    if !pending.input["components"]
+        .as_array()
+        .context("AI batch components must be an array")?
+        .is_empty()
+    {
         batches.push(pending.finish()?);
     }
     ensure!(batches.len() <= 512, "AI review exceeds 512 batches");

@@ -1,0 +1,15 @@
+# syntax=docker/dockerfile:1
+# Native musl builds produce standalone Linux binaries without a glibc minimum.
+FROM rust:1.99.1-alpine AS build
+ARG TARGETARCH
+RUN apk add --no-cache build-base cmake perl
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src/ src/
+COPY rules/ rules/
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=filtr-musl-${TARGETARCH},target=/build/target,sharing=locked \
+    cargo build --release --locked --bin filtr && cp target/release/filtr /usr/local/bin/filtr
+
+FROM scratch AS binary
+COPY --from=build /usr/local/bin/filtr /filtr

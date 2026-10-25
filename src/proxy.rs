@@ -125,17 +125,39 @@ pub(crate) async fn forward(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     request: Request,
 ) -> Response {
-    if let Some((status, code)) = unsafe_envelope(&request) {
-        return block(&state, status, code);
+    if let Some(reason) = state.traffic.block_reason() {
+        return block(&state, StatusCode::FORBIDDEN, reason);
     }
     {
         let Some(policy) = state.policy.load_full() else {
             return block(&state, StatusCode::SERVICE_UNAVAILABLE, "sbom-required");
         };
-        if let Some(rule) = policy.inspect_method(request.method()) {
+        if let Some(rule) = policy.inspect_request(
+            request.method(),
+            request.uri().path(),
+            request.headers(),
+            &[],
+        ) {
             return block(&state, StatusCode::FORBIDDEN, rule);
         }
     }
+    if let Some((status, code)) = unsafe_envelope(&request) {
+        return block(&state, status, code);
+    }
+    let metadata = match crate::forwarding::Metadata::read(
+        &state.config.forwarding,
+        request.headers(),
+        peer.ip(),
+    ) {
+        Ok(metadata) => metadata,
+        Err(_) => {
+            return block(
+                &state,
+                StatusCode::BAD_REQUEST,
+                "invalid-forwarding-metadata",
+            );
+        }
+    };
     let (parts, body) = request.into_parts();
     let bytes = match tokio::time::timeout(
         Duration::from_secs(state.config.timeout_secs),
@@ -160,11 +182,15 @@ pub(crate) async fn forward(
             "read-method-body-not-supported",
         );
     }
-    let policy = state
-        .policy
-        .load_full()
-        .expect("policy cannot be removed after activation");
-    if let Some(rule) = policy.inspect_method(&parts.method) {
+    let Some(policy) = state.policy.load_full() else {
+        return block(&state, StatusCode::SERVICE_UNAVAILABLE, "sbom-required");
+    };
+    if let Some(reason) = state.traffic.block_reason() {
+        return block(&state, StatusCode::FORBIDDEN, reason);
+    }
+    if let Some(rule) =
+        policy.inspect_request(&parts.method, parts.uri.path(), &parts.headers, &bytes)
+    {
         return block(&state, StatusCode::FORBIDDEN, rule);
     }
     let target = parts
@@ -197,21 +223,8 @@ pub(crate) async fn forward(
     };
     let mut headers = parts.headers;
     strip_hop_headers(&mut headers);
-    headers.remove(header::HOST);
     headers.remove(header::CONTENT_LENGTH);
-    let forwarding_headers: Vec<_> = headers
-        .keys()
-        .filter(|name| {
-            name.as_str().starts_with("x-forwarded-")
-                || matches!(name.as_str(), "forwarded" | "x-real-ip")
-        })
-        .cloned()
-        .collect();
-    for name in forwarding_headers {
-        headers.remove(name);
-    }
-    headers.insert("x-forwarded-for", peer.ip().to_string().parse().unwrap());
-    headers.insert("x-forwarded-proto", "http".parse().unwrap());
+    metadata.apply(&mut headers);
     state.counters.proxied.fetch_add(1, Ordering::Relaxed);
     let upstream = match state
         .client

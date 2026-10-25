@@ -32,6 +32,9 @@ async fn run() -> Result<()> {
         .await
         .context("cannot bind admin listener")?;
     let state = AppState::new(config).await?;
+    #[cfg(unix)]
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("cannot register SIGTERM handler")?;
     let (public, admin) = routers(state);
     tracing::info!(public = %listener.local_addr()?, admin = %admin_listener.local_addr()?, "Filtr listening");
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -57,7 +60,12 @@ async fn run() -> Result<()> {
     tokio::select! {
         result = &mut public_server => { shutdown_tx.send_replace(true); result??; anyhow::bail!("public listener stopped unexpectedly"); }
         result = &mut admin_server => { shutdown_tx.send_replace(true); result??; anyhow::bail!("admin listener stopped unexpectedly"); }
-        _ = shutdown_signal() => { shutdown_tx.send_replace(true); }
+        _ = async {
+            #[cfg(unix)]
+            tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
+            #[cfg(not(unix))]
+            let _ = tokio::signal::ctrl_c().await;
+        } => { shutdown_tx.send_replace(true); }
     }
     match tokio::time::timeout(std::time::Duration::from_secs(15), async {
         public_server.await??;
@@ -70,18 +78,4 @@ async fn run() -> Result<()> {
         Err(_) => tracing::warn!("graceful shutdown deadline exceeded"),
     }
     Ok(())
-}
-
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("cannot register SIGTERM handler");
-        tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
 }

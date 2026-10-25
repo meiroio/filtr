@@ -1,7 +1,7 @@
 use super::{Provider, Rejected, Review, ReviewedBatch};
 use crate::{
     generated,
-    policy::{Action, Report},
+    policy::{Action, Report, RequestFilter},
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -47,6 +47,37 @@ pub struct Discovery {
     pub source: String,
     pub reason: String,
     pub fixed_version: String,
+    #[serde(default)]
+    pub restriction: Option<RequestFilter>,
+    #[serde(default)]
+    pub coverage_note: String,
+    #[serde(default)]
+    pub emergency: Option<Emergency>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Emergency {
+    pub critical: bool,
+    pub remotely_exploitable: bool,
+    pub authentication_required: bool,
+    pub actively_exploited: bool,
+    pub affects_http1_upstream: bool,
+    pub source: String,
+    pub reason: String,
+}
+
+impl Discovery {
+    pub(crate) fn emergency_recommended(&self) -> bool {
+        self.restriction.is_none()
+            && self.emergency.as_ref().is_some_and(|e| {
+                e.critical
+                    && e.remotely_exploitable
+                    && !e.authentication_required
+                    && e.actively_exploited
+                    && e.affects_http1_upstream
+            })
+    }
 }
 
 pub(super) fn review_discoveries(
@@ -66,15 +97,22 @@ pub(super) fn review_discoveries(
             Err(anyhow::anyhow!(
                 "discovered component was not supplied in this AI batch"
             ))
-        } else if rules.len() >= 512 {
+        } else if rules.len() >= 512 || review.discoveries.len() >= 512 {
             Err(anyhow::anyhow!("AI review exceeds 512 accepted rules"))
         } else {
             validate(report, finding, &completed.reply.sources, index)
         };
         match result {
             Ok(rule) => {
-                rules.push(rule);
-                review.discoveries.push(finding.clone());
+                let mut accepted = finding.clone();
+                if let Some(rule) = rule {
+                    rules.push(rule);
+                } else if finding.restriction.is_some() {
+                    accepted.restriction = None;
+                    accepted.emergency = None;
+                    accepted.coverage_note = "Proposed restriction was unsupported or too broad; finding remains uncovered and requires SRE action.".into();
+                }
+                review.discoveries.push(accepted);
             }
             Err(error) => review.rejected.push(Rejected {
                 index,
@@ -142,8 +180,7 @@ pub(super) fn sources(response: &Value, provider: Provider) -> Result<BTreeSet<S
     .context("AI response items missing")?;
     for item in items {
         if provider == Provider::Anthropic && item["type"] == "web_search_tool_result" {
-            ensure!(item["content"].is_array(), "AI web search failed");
-            for result in item["content"].as_array().unwrap() {
+            for result in item["content"].as_array().context("AI web search failed")? {
                 if result["type"] == "web_search_result" {
                     add_source(&mut sources, &result["url"]);
                 }
@@ -184,7 +221,34 @@ pub(super) fn validate(
     finding: &Discovery,
     sources: &BTreeSet<String>,
     index: usize,
-) -> Result<generated::Rule> {
+) -> Result<Option<generated::Rule>> {
+    let (package, version) = validated_identity(report, finding, sources)?;
+    let Some(filter) = &finding.restriction else {
+        return Ok(None);
+    };
+    if filter.validate().is_err() {
+        return Ok(None);
+    }
+    Ok(Some(generated::Rule {
+        id: format!("ai:discovery:{index}"),
+        origin: "ai_discovery",
+        package: package.to_owned(),
+        version: Some(version.to_owned()),
+        basis: finding.cve.clone(),
+        cves: vec![finding.cve.clone()],
+        action: Action::Request {
+            filter: filter.clone(),
+        },
+        description: finding.reason.clone(),
+        source: finding.source.clone(),
+    }))
+}
+
+fn validated_identity<'a>(
+    report: &'a Report,
+    finding: &Discovery,
+    sources: &BTreeSet<String>,
+) -> Result<(&'a str, &'a str)> {
     let (year, number) = finding
         .cve
         .strip_prefix("CVE-")
@@ -220,15 +284,67 @@ pub(super) fn validate(
         .context("discovered component has no PURL")?;
     let version = known_version(component.version.as_deref())
         .context("discovered component has no installed version")?;
-    Ok(generated::Rule {
-        id: format!("ai:discovery:{index}"),
-        origin: "ai_discovery",
-        package: package.clone(),
-        version: Some(version.to_owned()),
-        basis: finding.cve.clone(),
-        cves: vec![finding.cve.clone()],
-        action: Action::DenyAll,
-        description: finding.reason.clone(),
-        source: finding.source.clone(),
-    })
+    ensure!(
+        finding.coverage_note.len() <= 2048,
+        "coverage note exceeds limit"
+    );
+    if let Some(emergency) = &finding.emergency {
+        ensure!(
+            sources.contains(&emergency.source)
+                && !emergency.reason.trim().is_empty()
+                && emergency.reason.len() <= 2048,
+            "emergency recommendation requires native-search evidence and explanation"
+        );
+    }
+    Ok((package, version))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn emergency_requires_every_risk_condition_and_no_narrow_mitigation() {
+        let emergency = Emergency {
+            critical: true,
+            remotely_exploitable: true,
+            authentication_required: false,
+            actively_exploited: true,
+            affects_http1_upstream: true,
+            source: "https://vendor.example/advisory".into(),
+            reason: "evidence".into(),
+        };
+        let finding = Discovery {
+            component_index: 0,
+            cve: "CVE-2026-12345".into(),
+            source: emergency.source.clone(),
+            reason: "test".into(),
+            fixed_version: "1.0.1".into(),
+            restriction: None,
+            coverage_note: "test".into(),
+            emergency: Some(emergency.clone()),
+        };
+        assert!(finding.emergency_recommended());
+        for flag in 0..5 {
+            let mut risk = emergency.clone();
+            match flag {
+                0 => risk.critical = false,
+                1 => risk.remotely_exploitable = false,
+                2 => risk.authentication_required = true,
+                3 => risk.actively_exploited = false,
+                _ => risk.affects_http1_upstream = false,
+            };
+            let mut f = finding.clone();
+            f.emergency = Some(risk);
+            assert!(!f.emergency_recommended());
+        }
+        let mut narrowed = finding;
+        narrowed.restriction = Some(RequestFilter {
+            methods: vec![],
+            path_prefix: "/specific".into(),
+            headers: vec![],
+            body_patterns: vec![],
+        });
+        assert!(!narrowed.emergency_recommended());
+    }
 }

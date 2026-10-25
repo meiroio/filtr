@@ -27,6 +27,10 @@ const VULNERABLE: &str = r#"{"bomFormat":"CycloneDX","specVersion":"1.6","compon
 const PATCHED: &str = r#"{"format":"filtr-1","packages":[{"purl":"pkg:maven/org.apache.logging.log4j/log4j-core@2.26.0"}]}"#;
 const RSC: &str =
     r#"{"format":"filtr-1","packages":[{"purl":"pkg:npm/react-server-dom-webpack@19.1.0"}]}"#;
+const PREVIEW_OLD: &str =
+    r#"{"format":"filtr-1","packages":[{"purl":"pkg:maven/example/component@1.0.0.RELEASE"}]}"#;
+const PREVIEW_NEW: &str =
+    r#"{"format":"filtr-1","packages":[{"purl":"pkg:maven/example/component@1.0.1.RELEASE"}]}"#;
 
 struct Harness {
     public: String,
@@ -74,8 +78,18 @@ impl Harness {
     async fn start_configured_with_webhook(
         sbom: &Path,
         ai: Option<Router>,
+        ai_config: filtr::ai::AiConfig,
+        webhook: filtr::webhook::Config,
+    ) -> Self {
+        Self::start_controlled(sbom, ai, ai_config, webhook, false).await
+    }
+
+    async fn start_controlled(
+        sbom: &Path,
+        ai: Option<Router>,
         mut ai_config: filtr::ai::AiConfig,
         webhook: filtr::webhook::Config,
+        auto_block: bool,
     ) -> Self {
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let public_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -111,8 +125,10 @@ impl Harness {
             admin_token: TOKEN.into(),
             sbom: sbom.into(),
             rules: None,
+            forwarding: Default::default(),
             ai: ai_config,
             webhook,
+            auto_block_critical: auto_block,
             max_body_bytes: 1024,
             timeout_secs: 1,
             max_in_flight: 4,
@@ -167,17 +183,36 @@ impl Harness {
             .unwrap()
     }
 
+    async fn preview(&self, sbom: &str, cache_only: bool) -> Value {
+        self.admin_report(
+            self.client
+                .post(format!("{}/v1/preview?cache_only={cache_only}", self.admin))
+                .header("content-type", "application/json")
+                .body(sbom.to_owned()),
+        )
+        .await
+    }
+
     async fn status(&self) -> Value {
-        let response = self
-            .client
-            .get(format!("{}/v1/status", self.admin))
-            .bearer_auth(TOKEN)
-            .send()
+        self.admin_report(self.client.get(format!("{}/v1/status", self.admin)))
             .await
-            .unwrap();
+    }
+
+    async fn admin_report(&self, request: reqwest::RequestBuilder) -> Value {
+        let response = request.bearer_auth(TOKEN).send().await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
-        serde_json::from_str(&response.text().await.unwrap()).unwrap()
+        serde_json::from_slice(&response.bytes().await.unwrap()).unwrap()
+    }
+
+    async fn traffic(&self, mode: &str) -> Value {
+        self.admin_report(
+            self.client
+                .post(format!("{}/v1/traffic", self.admin))
+                .header("content-type", "application/json")
+                .body(json!({"mode":mode,"reason":"Operator test decision"}).to_string()),
+        )
+        .await
     }
 
     async fn wait_for(&self, pointer: &str, expected: Value) -> Value {
@@ -210,6 +245,8 @@ async fn echo(request: Request) -> Response {
             "uri": parts.uri.to_string(), "method": parts.method.to_string(),
             "body": String::from_utf8_lossy(&body),
             "forwarded_for": parts.headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()),
+            "host": parts.headers.get("host").and_then(|v| v.to_str().ok()),
+            "scheme": parts.headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()),
             "forwarded": parts.headers.contains_key("forwarded"),
             "secret_header": parts.headers.contains_key("x-secret"),
             "cookie": parts.headers.get("cookie").and_then(|v| v.to_str().ok())
@@ -310,6 +347,8 @@ async fn forwards_original_request_and_preserves_response_status_headers_and_coo
         .header("connection", "x-secret")
         .header("x-secret", "strip-me")
         .header("x-forwarded-for", "attacker")
+        .header("host", "public.example:8443")
+        .header("x-forwarded-proto", "https")
         .header("forwarded", "for=attacker")
         .header("cookie", "session=abc")
         .body("unchanged + %41")
@@ -330,6 +369,8 @@ async fn forwards_original_request_and_preserves_response_status_headers_and_coo
     assert_eq!(body["uri"], "/echo?hello=a%2Fb");
     assert_eq!(body["body"], "unchanged + %41");
     assert_eq!(body["forwarded_for"], "127.0.0.1");
+    assert_eq!(body["host"], "public.example:8443");
+    assert_eq!(body["scheme"], "http");
     assert_eq!(body["forwarded"], false);
     assert_eq!(body["secret_header"], false);
     assert_eq!(body["cookie"], "session=abc");
@@ -399,15 +440,15 @@ async fn blocks_payloads_before_upstream_and_swaps_policy_without_restart() {
                 .await
                 .unwrap()
                 .status(),
-            StatusCode::FORBIDDEN
+            StatusCode::CREATED
         );
     }
     assert_eq!(
         app.client.get(&app.public).send().await.unwrap().status(),
         StatusCode::CREATED
     );
-    assert_eq!(app.hits.load(Ordering::SeqCst), 2);
-    assert_eq!(app.status().await["counters"]["blocked"], 7);
+    assert_eq!(app.hits.load(Ordering::SeqCst), 6);
+    assert_eq!(app.status().await["counters"]["blocked"], 3);
 }
 
 #[tokio::test]
@@ -666,21 +707,17 @@ async fn anthropic_discovers_missing_cves_with_search_provenance_and_cached_cont
             .as_array()
             .unwrap()
             .len(),
-        1
+        0
     );
     assert_eq!(
-        status["policy"]["generated_rules"][0]["origin"],
-        "ai_discovery"
-    );
-    assert_eq!(
-        status["policy"]["generated_rules"][0]["cves"],
-        json!(["CVE-2026-999901"])
+        status["policy"]["ai"]["discoveries"][0]["cve"],
+        "CVE-2026-999901"
     );
     assert_eq!(
         app.client.get(&app.public).send().await.unwrap().status(),
-        StatusCode::FORBIDDEN
+        StatusCode::CREATED
     );
-    assert_eq!(app.hits.load(Ordering::SeqCst), 0);
+    assert_eq!(app.hits.load(Ordering::SeqCst), 1);
     app.upload(r#"{"format":"filtr-1","packages":[{"purl":"pkg:npm/fictional-runtime@1.0.1"}]}"#)
         .await;
     let status = app.status().await;
@@ -716,7 +753,7 @@ async fn openai_discoveries_require_native_web_search_sources() {
     assert_eq!(review["usage"]["web_search_requests"], 1);
     assert_eq!(
         app.client.get(&app.public).send().await.unwrap().status(),
-        StatusCode::FORBIDDEN
+        StatusCode::CREATED
     );
 }
 
@@ -1113,7 +1150,7 @@ async fn anthropic_refusals_and_truncation_keep_static_mappings_without_openai()
 }
 
 #[tokio::test]
-async fn generated_quarantine_blocks_every_method_and_clears_after_patching() {
+async fn uncovered_findings_notify_without_blocking_and_clear_after_patching() {
     let directory = tempfile::tempdir().unwrap();
     let (webhook_url, mut events, webhook_task) = recording_webhook(StatusCode::NO_CONTENT).await;
     let ai = Router::new().route(
@@ -1146,15 +1183,23 @@ async fn generated_quarantine_blocks_every_method_and_clears_after_patching() {
         r#"{"format":"filtr-1","packages":[{"purl":"pkg:maven/example/component@1.0.0.RELEASE"}]}"#;
     app.upload(vulnerable).await;
     let status = app.status().await;
-    let generated = &status["policy"]["generated_rules"][0];
-    assert_eq!(generated["origin"], "ai_discovery");
-    assert_eq!(generated["version"], "1.0.0.RELEASE");
-    assert_eq!(generated["action"]["type"], "deny_all");
+    assert_eq!(status["policy"]["generated_rules"], json!([]));
+    assert_eq!(
+        status["policy"]["ai"]["discoveries"][0]["cve"],
+        "CVE-2026-12345"
+    );
     let (_, blocked, _) = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(blocked["remediation"]["quarantined"], true);
+    assert_eq!(blocked["remediation"]["quarantined"], false);
+    assert_eq!(
+        blocked["remediation"]["uncovered_vulnerabilities"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
     assert_eq!(blocked["remediation"]["ai_review"]["status"], "complete");
     for method in [
         reqwest::Method::GET,
@@ -1170,10 +1215,10 @@ async fn generated_quarantine_blocks_every_method_and_clears_after_patching() {
                 .await
                 .unwrap()
                 .status(),
-            StatusCode::FORBIDDEN
+            StatusCode::CREATED
         );
     }
-    assert_eq!(app.hits.load(Ordering::SeqCst), 0);
+    assert_eq!(app.hits.load(Ordering::SeqCst), 5);
     assert_eq!(app.upload(PATCHED).await.status(), StatusCode::OK);
     assert_eq!(app.status().await["policy"]["generated_rules"], json!([]));
     let (_, restored, _) = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
@@ -1199,7 +1244,7 @@ async fn restart_without_ai_uses_static_rules() {
     app.upload(VULNERABLE).await;
     assert_eq!(
         app.client.get(&app.public).send().await.unwrap().status(),
-        StatusCode::FORBIDDEN
+        StatusCode::CREATED
     );
     drop(app);
     let restarted = Harness::start(&path).await;
@@ -1286,7 +1331,7 @@ async fn openai_enhances_curated_rules_without_replacing_them() {
 }
 
 #[tokio::test]
-async fn invalid_ai_proposals_cannot_weaken_quarantine() {
+async fn broad_or_invalid_ai_proposals_are_rejected() {
     let directory = tempfile::tempdir().unwrap();
     let ai = Router::new().fallback(|| async { Json(openai_reply(json!([
         {"component_index":0,"basis":"log4shell-lookups","action":"deny_all","patterns":[],"reason":"An additive test marker."},
@@ -1301,19 +1346,15 @@ async fn invalid_ai_proposals_cannot_weaken_quarantine() {
     assert_eq!(status["policy"]["ai"]["status"], "partial");
     assert_eq!(
         status["policy"]["ai"]["rejected"].as_array().unwrap().len(),
-        4
+        5
     );
-    assert_eq!(status["policy"]["ai"]["applied_rules"], json!(["ai:0"]));
-    assert_eq!(status["policy"]["generated_rules"][0]["origin"], "ai");
-    assert_eq!(
-        status["policy"]["generated_rules"][0]["action"]["type"],
-        "deny_all"
-    );
+    assert_eq!(status["policy"]["ai"]["applied_rules"], json!([]));
+    assert_eq!(status["policy"]["generated_rules"], json!([]));
     assert_eq!(
         app.client.get(&app.public).send().await.unwrap().status(),
-        StatusCode::FORBIDDEN
+        StatusCode::CREATED
     );
-    assert_eq!(app.hits.load(Ordering::SeqCst), 0);
+    assert_eq!(app.hits.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -1397,6 +1438,661 @@ fn discovery_reply() -> Value {
             {"component_index":0,"cve":"CVE-2026-12345","source":"https://vendor.example/advisory","reason":"The vendor lists this exact version as affected through HTTP.","fixed_version":"1.0.1.RELEASE"}
         ]}).to_string()}]}
     ]})
+}
+
+fn targeted_reply() -> Value {
+    let mut response = discovery_reply();
+    let mut payload: Value = serde_json::from_str(
+        response["output"][1]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    payload["discoveries"][0]["restriction"] = json!({"methods":[],"path_prefix":"","headers":[{"name":"x-test-exploit","kind":"exact","value":"yes"}],"body_patterns":[]});
+    payload["discoveries"][0]["coverage_note"] = json!("Test marker scopes this request class.");
+    response["output"][1]["content"][0]["text"] = json!(payload.to_string());
+    response
+}
+
+fn emergency_reply() -> Value {
+    let mut response = discovery_reply();
+    response["output"][0]["action"]["sources"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"url":"https://vendor.example/active-exploitation"}));
+    let mut payload: Value = serde_json::from_str(
+        response["output"][1]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    payload["discoveries"][0]["emergency"] = json!({"critical":true,"remotely_exploitable":true,"authentication_required":false,"actively_exploited":true,"affects_http1_upstream":true,"source":"https://vendor.example/active-exploitation","reason":"Test evidence supports an actively exploited unauthenticated critical HTTP/1 issue without a narrow mitigation."});
+    payload["discoveries"][0]["coverage_note"] =
+        json!("No supported narrow mitigation in this test.");
+    response["output"][1]["content"][0]["text"] = json!(payload.to_string());
+    response
+}
+
+#[tokio::test]
+async fn manual_traffic_mode_persists_and_resumes_filters_without_bypass() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sbom.json");
+    let (url, mut events, task) = recording_webhook(StatusCode::NO_CONTENT).await;
+    let app = Harness::start_configured_with_webhook(
+        &path,
+        None,
+        Default::default(),
+        filtr::webhook::Config {
+            webhook_url: Some(url),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        app.client
+            .post(format!("{}/v1/traffic", app.admin))
+            .body(r#"{"mode":"block_all","reason":"test"}"#)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    for body in [
+        r#"{"mode":"bypass","reason":"bad"}"#,
+        r#"{"mode":"filter","reason":""}"#,
+        r#"{"mode":"block_all","reason":"x","unknown":true}"#,
+    ] {
+        assert_eq!(
+            app.client
+                .post(format!("{}/v1/traffic", app.admin))
+                .bearer_auth(TOKEN)
+                .body(body)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+    assert_eq!(app.traffic("block_all").await["effective"], "blocked");
+    let (_, event, _) = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(event["trigger"], "traffic_mode");
+    assert_eq!(event["remediation"]["traffic"]["mode"], "block_all");
+    assert_eq!(event["remediation"]["quarantined"], true);
+    assert_eq!(
+        app.client.get(&app.public).send().await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    app.upload(VULNERABLE).await;
+    app.preview(PATCHED, true).await;
+    app.upload(PATCHED).await;
+    assert_eq!(
+        app.client.get(&app.public).send().await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    drop(app);
+    let restarted = Harness::start(&path).await;
+    assert_eq!(restarted.status().await["traffic"]["mode"], "block_all");
+    assert_eq!(
+        restarted
+            .client
+            .get(&restarted.public)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(restarted.traffic("filter").await["effective"], "filtering");
+    restarted.upload(VULNERABLE).await;
+    assert_eq!(
+        restarted
+            .client
+            .get(&restarted.public)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        restarted
+            .client
+            .post(&restarted.public)
+            .body("${jndi:test}")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let state_path = directory.path().join("sbom.json.traffic.json");
+    std::fs::remove_file(&state_path).unwrap();
+    std::fs::create_dir(&state_path).unwrap();
+    assert_eq!(
+        restarted
+            .client
+            .post(format!("{}/v1/traffic", restarted.admin))
+            .bearer_auth(TOKEN)
+            .body(r#"{"mode":"block_all","reason":"Cannot persist"}"#)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(restarted.status().await["traffic"]["mode"], "filter");
+    task.abort();
+}
+
+#[tokio::test]
+async fn targeted_ai_rule_blocks_only_matching_header_class() {
+    let directory = tempfile::tempdir().unwrap();
+    let ai = Router::new().fallback(|| async { Json(targeted_reply()) });
+    let app = Harness::start_with_services(&directory.path().join("sbom.json"), Some(ai)).await;
+    app.upload(PREVIEW_OLD).await;
+    assert_eq!(
+        app.status().await["policy"]["generated_rules"][0]["action"]["type"],
+        "request"
+    );
+    assert_eq!(
+        app.client.get(&app.public).send().await.unwrap().status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        app.client
+            .post(&app.public)
+            .body("normal JSON")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        app.client
+            .get(&app.public)
+            .header("x-test-exploit", "no")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        app.client
+            .get(&app.public)
+            .header("x-test-exploit", "YES")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let report = app
+        .admin_report(app.client.get(format!("{}/v1/remediation", app.admin)))
+        .await;
+    assert_eq!(report["quarantined"], false);
+    assert_eq!(report["summary"]["blocking_rules"], 1);
+    assert_eq!(report["summary"]["uncovered_findings"], 0);
+}
+
+#[tokio::test]
+async fn critical_auto_block_is_opt_in_and_operator_filter_wins() {
+    let directory = tempfile::tempdir().unwrap();
+    let ai = Router::new()
+        .route("/leaderboard", get(|| async { Json(test_leaderboard()) }))
+        .route(
+            "/v1/responses",
+            post(|Json(request): Json<Value>| async move {
+                let input: Value =
+                    serde_json::from_str(request["input"][0]["content"].as_str().unwrap()).unwrap();
+                Json(if input["components"][0]["version"] == "2.14.1" {
+                    emergency_reply()
+                } else {
+                    openai_reply(json!([]))
+                })
+            }),
+        );
+    let path = directory.path().join("sbom.json");
+    let app = Harness::start_controlled(
+        &path,
+        Some(ai),
+        filtr::ai::AiConfig {
+            api_key: Some("test-key".into()),
+            ..Default::default()
+        },
+        Default::default(),
+        true,
+    )
+    .await;
+    app.upload(VULNERABLE).await;
+    assert_eq!(
+        app.status().await["traffic"]["block_reason"],
+        "traffic-blocked-critical"
+    );
+    assert_eq!(
+        app.client.get(&app.public).send().await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(app.traffic("filter").await["effective"], "filtering");
+    assert_eq!(
+        app.client.get(&app.public).send().await.unwrap().status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(
+        app.client
+            .post(&app.public)
+            .body("${jndi:test}")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(app.traffic("auto").await["effective"], "blocked");
+    app.upload(PATCHED).await;
+    assert_eq!(app.status().await["traffic"]["effective"], "filtering");
+    app.upload(VULNERABLE).await;
+    assert_eq!(app.status().await["traffic"]["effective"], "blocked");
+    let mut offline = app.ai_config.clone();
+    offline.api_key = None;
+    offline.anthropic_api_key = None;
+    drop(app);
+    let restarted = Harness::start_controlled(&path, None, offline, Default::default(), true).await;
+    assert_eq!(
+        restarted.status().await["policy"]["ai"]["status"],
+        "not_configured"
+    );
+    assert_eq!(
+        restarted
+            .client
+            .get(&restarted.public)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(restarted.traffic("filter").await["effective"], "filtering");
+    drop(restarted);
+    let ai = Router::new().fallback(|| async { Json(emergency_reply()) });
+    let default_app =
+        Harness::start_with_services(&directory.path().join("default.json"), Some(ai)).await;
+    default_app.upload(PREVIEW_OLD).await;
+    assert_eq!(
+        default_app.status().await["traffic"]["auto_block_critical"],
+        false
+    );
+    assert_eq!(
+        default_app
+            .client
+            .get(&default_app.public)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CREATED
+    );
+}
+
+#[tokio::test]
+async fn kill_switch_remains_available_while_ai_preview_runs() {
+    let directory = tempfile::tempdir().unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let started = entered.clone();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let resume = release.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let ai = Router::new().fallback(move || {
+        let entered = started.clone();
+        let release = resume.clone();
+        let call = count.fetch_add(1, Ordering::SeqCst);
+        async move {
+            if call > 0 {
+                entered.notify_one();
+                release.notified().await;
+            }
+            Json(openai_reply(json!([])))
+        }
+    });
+    let app = Harness::start_configured(
+        &directory.path().join("sbom.json"),
+        Some(ai),
+        filtr::ai::AiConfig {
+            api_key: Some("test-key".into()),
+            model: Some("openai/test-model".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    app.upload(PREVIEW_OLD).await;
+    let preview = app.preview(PREVIEW_NEW, false);
+    let control = async {
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(app.traffic("block_all").await["effective"], "blocked");
+        assert_eq!(
+            app.client.get(&app.public).send().await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        release.notify_one();
+    };
+    let (result, ()) = tokio::join!(preview, control);
+    assert_eq!(result["candidate"]["remediation"]["quarantined"], true);
+    assert_eq!(app.traffic("filter").await["effective"], "filtering");
+}
+
+#[tokio::test]
+async fn preview_validates_requests_and_never_installs_an_initial_policy() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sbom.json");
+    let app = Harness::start(&path).await;
+    assert_eq!(
+        app.client
+            .post(format!("{}/v1/preview?cache_only=true", app.admin))
+            .body(PATCHED)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    for (query, body, status) in [
+        ("cache_only=invalid", PATCHED, StatusCode::BAD_REQUEST),
+        ("cache_onyl=true", PATCHED, StatusCode::BAD_REQUEST),
+        (
+            "cache_only=true",
+            "invalid-json",
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+    ] {
+        assert_eq!(
+            app.client
+                .post(format!("{}/v1/preview?{query}", app.admin))
+                .bearer_auth(TOKEN)
+                .body(body)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            status
+        );
+    }
+    assert_eq!(
+        app.client
+            .post(format!("{}/v1/preview?cache_only=true", app.admin))
+            .bearer_auth(TOKEN)
+            .header("content-encoding", "gzip")
+            .body(PATCHED)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNSUPPORTED_MEDIA_TYPE
+    );
+    let result = app.preview(PATCHED, true).await;
+    assert_eq!(result["installed"], false);
+    assert!(result["baseline"].is_null());
+    assert_eq!(result["analysis_complete"], false);
+    assert_eq!(
+        result["candidate"]["policy"]["ai"]["unreviewed_components"],
+        json!([0])
+    );
+    assert_eq!(result["candidate"]["policy"]["ai"]["attempts"], json!([]));
+    assert_eq!(app.status().await["ready"], false);
+    assert_eq!(
+        app.client.get(&app.public).send().await.unwrap().status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert!(!path.exists());
+    assert!(!directory.path().join("sbom.json.ai-cache.json").exists());
+    assert!(!directory.path().join("sbom.json.leaderboard.json").exists());
+}
+
+#[tokio::test]
+async fn preview_reuses_cache_and_paid_reviews_without_policy_or_webhook_changes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sbom.json");
+    let cache = directory.path().join("sbom.json.ai-cache.json");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let ai = Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let call = count.fetch_add(1, Ordering::SeqCst);
+            async move {
+                Json(match call {
+                    0 => discovery_reply(),
+                    1 => openai_reply(json!([])),
+                    _ => panic!("unexpected AI call"),
+                })
+            }
+        }),
+    );
+    let (url, mut events, task) = recording_webhook(StatusCode::NO_CONTENT).await;
+    let app = Harness::start_configured_with_webhook(
+        &path,
+        Some(ai),
+        filtr::ai::AiConfig {
+            api_key: Some("test-key".into()),
+            model: Some("openai/preview-test-model".into()),
+            ..Default::default()
+        },
+        filtr::webhook::Config {
+            webhook_url: Some(url),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(app.upload(PREVIEW_OLD).await.status(), StatusCode::OK);
+    tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let live = app.status().await["policy"].clone();
+    let saved = std::fs::read(&path).unwrap();
+    let original_cache = std::fs::read(&cache).unwrap();
+    let unavailable = app.preview(PREVIEW_NEW, true).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(unavailable["analysis_complete"], false);
+    assert_eq!(unavailable["diff"]["resolved_cves"], json!([]));
+    assert_eq!(
+        unavailable["diff"]["unverified_absent_cves"],
+        json!(["CVE-2026-12345"])
+    );
+    assert_eq!(std::fs::read(&cache).unwrap(), original_cache);
+    let partial = app.preview(r#"{"format":"filtr-1","packages":[{"purl":"pkg:maven/example/component@1.0.0.RELEASE"},{"purl":"pkg:npm/new-helper@1.0.0"},{"purl":"pkg:npm/new-helper@1.0.0"}]}"#, true).await;
+    assert_eq!(partial["candidate"]["policy"]["ai"]["cache"]["hits"], 1);
+    assert_eq!(
+        partial["candidate"]["policy"]["ai"]["unreviewed_components"],
+        json!([1, 2])
+    );
+    assert_eq!(partial["candidate"]["remediation"]["quarantined"], false);
+    let reviewed = app.preview(PREVIEW_NEW, false).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(reviewed["analysis_complete"], true);
+    assert_eq!(reviewed["diff"]["resolved_cves"], json!(["CVE-2026-12345"]));
+    assert_eq!(
+        reviewed["diff"]["components_added"][0]["installed_version"],
+        "1.0.1.RELEASE"
+    );
+    let warmed_cache = std::fs::read(&cache).unwrap();
+    let cached = app.preview(PREVIEW_NEW, true).await;
+    assert_eq!(cached["analysis_complete"], true);
+    assert_eq!(cached["candidate"]["policy"]["ai"]["cache"]["hits"], 1);
+    assert_eq!(cached["candidate"]["policy"]["ai"]["attempts"], json!([]));
+    assert_eq!(
+        cached["candidate"]["policy"]["ai"]["usage"]["web_search_requests"],
+        0
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(std::fs::read(&cache).unwrap(), warmed_cache);
+    assert_eq!(std::fs::read(&path).unwrap(), saved);
+    assert_eq!(app.status().await["policy"], live);
+    assert_eq!(
+        app.client.get(&app.public).send().await.unwrap().status(),
+        StatusCode::CREATED
+    );
+    assert!(!directory.path().join("sbom.json.leaderboard.json").exists());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), events.recv())
+            .await
+            .is_err()
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn preview_reads_saved_rankings_and_keeps_live_policy_during_review() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sbom.json");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let ranks = Arc::new(AtomicUsize::new(0));
+    let rank_count = ranks.clone();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let started = entered.clone();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let resume = release.clone();
+    let ai = Router::new()
+        .route(
+            "/leaderboard",
+            get(move || {
+                rank_count.fetch_add(1, Ordering::SeqCst);
+                async { Json(test_leaderboard()) }
+            }),
+        )
+        .route(
+            "/v1/responses",
+            post(move || {
+                let call = count.fetch_add(1, Ordering::SeqCst);
+                let entered = started.clone();
+                let release = resume.clone();
+                async move {
+                    if call == 1 {
+                        entered.notify_one();
+                        release.notified().await;
+                    }
+                    Json(openai_reply(json!([])))
+                }
+            }),
+        );
+    let app = Harness::start_configured(
+        &path,
+        Some(ai),
+        filtr::ai::AiConfig {
+            api_key: Some("test-key".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    app.upload(PREVIEW_OLD).await;
+    let live = app.status().await["policy"].clone();
+    let snapshot_path = directory.path().join("sbom.json.leaderboard.json");
+    let snapshot = std::fs::read(&snapshot_path).unwrap();
+    let pending = app.preview(PREVIEW_NEW, false);
+    let verify = async {
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(app.status().await["policy"], live);
+        assert_eq!(
+            app.client.get(&app.public).send().await.unwrap().status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(app.upload(PATCHED).await.status(), StatusCode::CONFLICT);
+        release.notify_one();
+    };
+    let (result, ()) = tokio::join!(pending, verify);
+    assert_eq!(result["analysis_complete"], true);
+    assert_eq!(ranks.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(std::fs::read(&snapshot_path).unwrap(), snapshot);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), PREVIEW_OLD);
+    assert_eq!(app.status().await["policy"], live);
+    let mut offline_config = app.ai_config.clone();
+    offline_config.api_key = None;
+    offline_config.anthropic_api_key = None;
+    drop(app);
+    let offline = Harness::start_configured(&path, None, offline_config).await;
+    let cached = offline.preview(PREVIEW_NEW, true).await;
+    assert_eq!(cached["analysis_complete"], true);
+    assert_eq!(cached["candidate"]["policy"]["ai"]["cache"]["hits"], 1);
+    assert_eq!(cached["candidate"]["policy"]["ai"]["attempts"], json!([]));
+}
+
+#[tokio::test]
+async fn preview_reports_timeouts_and_expired_cache_without_policy_changes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sbom.json");
+    let cache = directory.path().join("sbom.json.ai-cache.json");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let ai = Router::new().route(
+        "/v1/responses",
+        post(move || {
+            let call = count.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if call > 0 {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                }
+                Json(discovery_reply())
+            }
+        }),
+    );
+    let app = Harness::start_configured(
+        &path,
+        Some(ai),
+        filtr::ai::AiConfig {
+            api_key: Some("test-key".into()),
+            model: Some("openai/preview-test-model".into()),
+            ai_review_timeout_secs: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+    app.upload(PREVIEW_OLD).await;
+    let live = app.status().await["policy"].clone();
+    let original_cache = std::fs::read(&cache).unwrap();
+    let failed = app.preview(PREVIEW_NEW, false).await;
+    assert_eq!(failed["analysis_complete"], false);
+    assert_eq!(failed["candidate"]["policy"]["ai"]["status"], "failed");
+    assert_eq!(
+        failed["candidate"]["policy"]["ai"]["unreviewed_components"],
+        json!([0])
+    );
+    assert_eq!(failed["diff"]["resolved_cves"], json!([]));
+    assert_eq!(std::fs::read(&cache).unwrap(), original_cache);
+    let mut expired: Value = serde_json::from_slice(&original_cache).unwrap();
+    for entry in expired["entries"].as_object_mut().unwrap().values_mut() {
+        entry["checked_at"] = json!(0);
+    }
+    std::fs::write(&cache, serde_json::to_vec(&expired).unwrap()).unwrap();
+    let expired_bytes = std::fs::read(&cache).unwrap();
+    let cached = app.preview(PREVIEW_OLD, true).await;
+    assert_eq!(cached["analysis_complete"], false);
+    assert_eq!(cached["candidate"]["policy"]["ai"]["cache"]["hits"], 0);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(std::fs::read(&cache).unwrap(), expired_bytes);
+    std::fs::write(&cache, "invalid-cache").unwrap();
+    let corrupt = app.preview(PREVIEW_OLD, true).await;
+    assert_eq!(corrupt["analysis_complete"], false);
+    assert_eq!(corrupt["candidate"]["policy"]["ai"]["status"], "failed");
+    assert_eq!(corrupt["candidate"]["policy"]["ai"]["attempts"], json!([]));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(std::fs::read_to_string(&cache).unwrap(), "invalid-cache");
+    assert_eq!(app.status().await["policy"], live);
+    assert_eq!(
+        app.client.get(&app.public).send().await.unwrap().status(),
+        StatusCode::CREATED
+    );
 }
 
 fn large_inventory() -> String {
@@ -1511,7 +2207,7 @@ async fn generated_rules_activate_only_after_ai_review_succeeds() {
         let completion = completion.clone();
         async move {
             completion.notified().await;
-            Json(discovery_reply())
+            Json(targeted_reply())
         }
     });
     let app = Harness::start_with_services(&directory.path().join("sbom.json"), Some(ai)).await;
@@ -1542,7 +2238,13 @@ async fn generated_rules_activate_only_after_ai_review_succeeds() {
     let complete = app.status().await;
     assert_eq!(complete["policy"]["ai"]["status"], "complete");
     assert_eq!(
-        app.client.get(&app.public).send().await.unwrap().status(),
+        app.client
+            .get(&app.public)
+            .header("x-test-exploit", "yes")
+            .send()
+            .await
+            .unwrap()
+            .status(),
         StatusCode::FORBIDDEN
     );
     assert_eq!(app.hits.load(Ordering::SeqCst), 1);
@@ -1815,10 +2517,7 @@ async fn pinned_models_reuse_component_reviews_across_uploads_and_offline_restar
         status["policy"]["ai"]["discoveries"][0]["component_index"],
         1
     );
-    assert_eq!(
-        status["policy"]["generated_rules"][0]["package"],
-        "pkg:npm/a"
-    );
+    assert_eq!(status["policy"]["components"][1]["package"], "pkg:npm/a");
     let added = r#"{"format":"filtr-1","packages":[{"purl":"pkg:npm/b@1.0.0"},{"purl":"pkg:npm/a@1.0.0"},{"purl":"pkg:npm/c@2.0.0"}]}"#;
     app.upload(added).await;
     assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -1867,7 +2566,7 @@ async fn expiration_automatically_refreshes_the_unchanged_running_inventory() {
                 Json(if count.fetch_add(1, Ordering::SeqCst) == 0 {
                     openai_reply(json!([]))
                 } else {
-                    discovery_reply()
+                    targeted_reply()
                 })
             }
         }),
@@ -1901,7 +2600,13 @@ async fn expiration_automatically_refreshes_the_unchanged_running_inventory() {
     assert_eq!(refreshed["policy"]["ai"]["status"], "complete");
     assert_eq!(refreshed["policy"]["ai"]["cache"]["hits"], 0);
     assert_eq!(
-        app.client.get(&app.public).send().await.unwrap().status(),
+        app.client
+            .get(&app.public)
+            .header("x-test-exploit", "yes")
+            .send()
+            .await
+            .unwrap()
+            .status(),
         StatusCode::FORBIDDEN
     );
 }
@@ -2219,9 +2924,10 @@ async fn remediation_reads_cached_findings_without_provider_calls() {
             .unwrap();
         assert_eq!(response.headers()["cache-control"], "no-store");
         let remediation: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
-        assert_eq!(remediation["quarantined"], true);
-        assert_eq!(remediation["summary"]["blocking_rules"], 1);
-        let component = &remediation["blockers"][0]["affected_components"][0];
+        assert_eq!(remediation["quarantined"], false);
+        assert_eq!(remediation["summary"]["blocking_rules"], 0);
+        assert_eq!(remediation["summary"]["uncovered_findings"], 1);
+        let component = &remediation["uncovered_vulnerabilities"][0]["affected_components"][0];
         assert_eq!(component["component_index"], 0);
         assert_eq!(component["package"], "pkg:npm/a");
         assert_eq!(component["sources"][0]["name"], "api");

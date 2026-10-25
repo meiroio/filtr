@@ -1,4 +1,4 @@
-use crate::policy::{Action, Report};
+use crate::policy::Report;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
@@ -71,22 +71,64 @@ pub(crate) fn report(policy: &Report) -> Value {
         .map(|r| &r.cve)
         .chain(policy.generated_rules.iter().flat_map(|r| &r.cves))
         .collect();
-    let quarantined = policy
-        .active_rules
-        .iter()
-        .map(|r| &r.action)
-        .chain(policy.generated_rules.iter().map(|r| &r.action))
-        .any(|action| matches!(action, Action::DenyAll));
+    let uncovered = uncovered(policy);
     json!({
         "version": 1,
-        "quarantined": quarantined,
-        "scope": "whole_upstream",
-        "summary": {"blocking_rules": blockers.len(), "blocking_cves": cves.len(), "inventory_gaps": policy.inventory_gaps.len()},
+        "quarantined": false,
+        "scope": "matching_requests",
+        "summary": {"blocking_rules": blockers.len(), "blocking_cves": cves.len(), "uncovered_findings":uncovered.len(),"inventory_gaps": policy.inventory_gaps.len()},
         "blockers": blockers,
+        "uncovered_vulnerabilities": uncovered,
+        "transport": {"listener":["HTTP/1.0","HTTP/1.1"],"upstream":"HTTP/1.1","http3":"Not accepted or inspected; mitigate HTTP/3-specific issues at the QUIC/ingress endpoint."},
         "inventory_gaps": inventory(policy)["gaps"],
         "ai_review": {"status": policy.ai.status, "cache": policy.ai.cache},
         "warning": "Read-only installed-policy report; no AI, advisory, leaderboard or refresh calls. Fixed versions are cached AI suggestions, not independently verified upgrade guarantees. Source/image attribution is supplied by the SBOM, not inferred. Inventory gaps do not block traffic. No active rules does not establish vulnerability-free software.",
     })
+}
+
+fn uncovered(policy: &Report) -> Vec<Value> {
+    let mut uncovered = Vec::new();
+    for rule in &policy.advisory_rules {
+        let components: Vec<_> = policy
+            .components
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.advisory_rules.contains(&rule.id))
+            .map(|(index, _)| affected_component(policy, index, &[&rule.cve]))
+            .collect();
+        uncovered.push(json!({"cve":rule.cve,"origin":"static","reason":rule.description,"source":rule.source,"coverage_note":"Catalogue restriction is broader than targeted filtering; no narrow rule is installed.","affected_components":components}));
+    }
+    for finding in &policy.ai.discoveries {
+        let covered = policy.generated_rules.iter().any(|rule| {
+            rule.cves.contains(&finding.cve)
+                && policy
+                    .components
+                    .get(finding.component_index)
+                    .is_some_and(|item| {
+                        item.component.package.as_ref() == Some(&rule.package)
+                            && rule.version.as_ref().is_none_or(|version| {
+                                item.component.version.as_ref() == Some(version)
+                            })
+                    })
+        });
+        if !covered {
+            uncovered.push(json!({"cve":finding.cve,"origin":"ai_discovery","reason":finding.reason,"source":finding.source,
+                "coverage_note":if finding.coverage_note.is_empty(){"No evidenced narrow restriction was provided; SRE action required."}else{&finding.coverage_note},
+                "affected_components":[affected_component(policy,finding.component_index,&[&finding.cve])],"emergency_recommended":finding.emergency_recommended(),"emergency":finding.emergency}));
+        }
+    }
+    uncovered
+}
+
+pub(crate) fn with_traffic(policy: &Report, traffic: Value) -> Value {
+    let mut report = report(policy);
+    let blocked = traffic["effective"] == "blocked";
+    report["quarantined"] = json!(blocked);
+    if blocked {
+        report["scope"] = json!("whole_upstream");
+    }
+    report["traffic"] = traffic;
+    report
 }
 
 fn affected_component(policy: &Report, index: usize, cves: &[&str]) -> Value {
@@ -102,7 +144,7 @@ fn affected_component(policy: &Report, index: usize, cves: &[&str]) -> Value {
     component
 }
 
-fn component_details(policy: &Report, index: usize) -> Value {
+pub(crate) fn component_details(policy: &Report, index: usize) -> Value {
     let component = &policy.components[index].component;
     json!({
         "component_index": index, "name": component.name, "package": component.package,

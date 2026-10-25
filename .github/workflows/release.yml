@@ -1,0 +1,59 @@
+name: Linux prebuilt binaries
+on:
+  push:
+    tags: ['v[0-9]*']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            architecture: amd64
+          - runner: ubuntu-24.04-arm
+            architecture: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Package binary and installer
+        env:
+          VERSION: ${{ github.ref_type == 'tag' && github.ref_name || 'development' }}
+          ARCH: ${{ matrix.architecture }}
+        run: sh deploy/package-release.sh "$VERSION" "$ARCH" dist
+      - name: Smoke test archive
+        run: |
+          mkdir smoke
+          tar -xzf dist/*.tar.gz -C smoke
+          cd smoke
+          sha256sum -c SHA256SUMS
+          ./filtr --version
+          ./filtr-install --help
+      - name: Apache/PHP integration and rollback
+        run: sh tests/simple/run.sh dist
+      - name: Node/Express integration and rollback
+        run: sh tests/simple/run-node.sh dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: filtr-linux-${{ matrix.architecture }}
+          path: dist/*
+  publish:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: filtr-linux-*
+          path: dist
+          merge-multiple: true
+      - name: Attach versioned archives and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ github.ref_name }}
+        run: gh release create "$VERSION" dist/* --title "Filtr $VERSION" --generate-notes

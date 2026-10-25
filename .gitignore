@@ -8,3 +8,5 @@
 .ripwire_quality_baseline
 .ripwire_quality_acks
 .DS_Store
+__pycache__/
+*.pyc

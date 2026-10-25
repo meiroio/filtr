@@ -121,7 +121,7 @@ pub(super) async fn select(
     .await?
     .context("saved leaderboard unavailable; upload an SBOM to refresh it")?;
     ensure!(
-        snapshot.inventory == inventory,
+        matches!(trigger, ReviewTrigger::Preview { .. }) || snapshot.inventory == inventory,
         "saved leaderboard belongs to a different inventory or static catalogue; upload an SBOM to refresh it"
     );
     choose(&snapshot.leaderboard, config)

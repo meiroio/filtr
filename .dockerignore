@@ -10,4 +10,9 @@
 !examples/upstream.rs
 !deploy/
 !deploy/probe.sh
+!deploy/simple/
+!deploy/simple/Dockerfile.release
+!tests/
+!tests/simple/
+!tests/simple/*.py
 !Dockerfile

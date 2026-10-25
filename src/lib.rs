@@ -1,12 +1,15 @@
 #![forbid(unsafe_code)]
 
 pub mod ai;
+pub mod forwarding;
 pub mod generated;
 mod network;
 pub mod policy;
+mod preview;
 mod proxy;
 mod remediation;
 pub mod sbom;
+mod traffic;
 pub mod webhook;
 
 use anyhow::{Context, Result, ensure};
@@ -58,19 +61,24 @@ pub struct Config {
     #[arg(long, env = "FILTR_RULES")]
     pub rules: Option<PathBuf>,
     #[command(flatten)]
+    pub forwarding: forwarding::Config,
+    #[command(flatten)]
     pub ai: ai::AiConfig,
     #[command(flatten)]
     pub webhook: webhook::Config,
-    #[arg(long, default_value_t = 1_048_576)]
+    #[arg(long, env = "FILTR_AUTO_BLOCK_CRITICAL", default_value_t = false)]
+    pub auto_block_critical: bool,
+    #[arg(long, env = "FILTR_MAX_BODY_BYTES", default_value_t = 1_048_576)]
     pub max_body_bytes: usize,
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, env = "FILTR_TIMEOUT_SECS", default_value_t = 10)]
     pub timeout_secs: u64,
-    #[arg(long, default_value_t = 128)]
+    #[arg(long, env = "FILTR_MAX_IN_FLIGHT", default_value_t = 128)]
     pub max_in_flight: usize,
 }
 
 impl Config {
     pub fn validate(&self) -> Result<()> {
+        self.forwarding.validate()?;
         self.ai.validate()?;
         self.webhook.validate()?;
         ensure!(
@@ -141,6 +149,7 @@ pub struct AppState {
     client: reqwest::Client,
     ai: ai::Client,
     webhook: Option<webhook::Notifier>,
+    traffic: traffic::Controller,
     counters: Counters,
     requests: Arc<Semaphore>,
     admin_requests: Arc<Semaphore>,
@@ -165,10 +174,12 @@ impl AppState {
         };
         let ai = ai::Client::new(config.ai.clone(), &config.sbom)?;
         let webhook = webhook::Notifier::new(&config.webhook, &config.upstream)?;
+        let traffic = traffic::Controller::load(&config.sbom, config.auto_block_critical)?;
         let policy = match read_bounded(&config.sbom) {
             Ok(bytes) => {
                 let mut policy = Policy::compile(sbom::parse(&bytes)?, &catalog)?;
                 ai.enhance(&mut policy, ai::ReviewTrigger::Startup).await;
+                traffic.observe(&policy.report).await;
                 Some(Arc::new(policy))
             }
             Err(error)
@@ -196,15 +207,30 @@ impl AppState {
             client,
             ai,
             webhook,
+            traffic,
             policy: ArcSwapOption::from(policy),
             counters: Counters::default(),
             updates: Arc::new(Mutex::new(())),
         });
-        if let (Some(notifier), Some(policy)) = (&state.webhook, state.policy.load_full()) {
-            notifier.notify(&policy.report, ai::ReviewTrigger::Startup);
+        if state.policy.load().is_some() || state.traffic.block_reason().is_some() {
+            state.notify("startup");
         }
         schedule_refresh(&state);
         Ok(state)
+    }
+
+    fn remediation(&self, report: &policy::Report) -> serde_json::Value {
+        remediation::with_traffic(report, self.traffic.report(true))
+    }
+
+    fn notify(&self, trigger: &'static str) {
+        let Some(notifier) = &self.webhook else {
+            return;
+        };
+        let report = self.policy.load_full().map_or_else(
+            || json!({"version":1,"quarantined":self.traffic.block_reason().is_some(),"blockers":[],"uncovered_vulnerabilities":[],"inventory_gaps":[],"ai_review":{"status":"not_configured"},"traffic":self.traffic.report(false)}),
+            |policy| self.remediation(&policy.report));
+        notifier.notify(report, trigger);
     }
 }
 
@@ -252,11 +278,13 @@ async fn reanalyze(
     policy.report.ai = state.ai.pending_review();
     state.policy.store(Some(Arc::new(policy.clone())));
     state.ai.enhance(&mut policy, trigger).await;
+    state.traffic.observe(&policy.report).await;
     let policy = Arc::new(policy);
     state.policy.store(Some(policy.clone()));
-    if let Some(notifier) = &state.webhook {
-        notifier.notify(&policy.report, trigger);
-    }
+    state.notify(match trigger {
+        ai::ReviewTrigger::Expired => "cache_expired",
+        _ => "manual_refresh",
+    });
     Ok(policy)
 }
 
@@ -285,6 +313,8 @@ pub fn routers(state: Arc<AppState>) -> (Router, Router) {
         .route("/v1/rules", get(rules))
         .route("/v1/remediation", get(remediation))
         .route("/v1/sbom", post(upload))
+        .route("/v1/preview", post(preview::preview))
+        .route("/v1/traffic", get(traffic::get).post(traffic::set))
         .route("/v1/refresh", post(refresh))
         .layer(middleware::from_fn_with_state(state.clone(), admin_gate))
         .with_state(state);
@@ -325,18 +355,20 @@ async fn admin_gate(State(state): State<Arc<AppState>>, request: Request, next: 
         .unwrap_or_default();
     if !bool::from(provided.ct_eq(expected.as_bytes())) {
         let mut response = error(StatusCode::UNAUTHORIZED, "unauthorized");
-        response
-            .headers_mut()
-            .insert(header::WWW_AUTHENTICATE, "Bearer".parse().unwrap());
+        response.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            axum::http::HeaderValue::from_static("Bearer"),
+        );
         return response;
     }
     let Ok(_permit) = state.admin_requests.clone().try_acquire_owned() else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "capacity-exceeded");
     };
     let mut response = next.run(request).await;
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
     response
 }
 
@@ -359,6 +391,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Response {
         "ready": policy.is_some(),
         "inventory": policy.as_ref().map(|p| remediation::inventory(&p.report)),
         "policy": policy.as_ref().map(|p| &p.report),
+        "traffic": state.traffic.report(policy.is_some()),
         "limits": {"body_bytes": state.config.max_body_bytes, "timeout_secs": state.config.timeout_secs, "max_in_flight": state.config.max_in_flight},
         "counters": {
             "seen": state.counters.seen.load(Ordering::Relaxed),
@@ -378,7 +411,7 @@ async fn remediation(State(state): State<Arc<AppState>>) -> Response {
     let Some(policy) = state.policy.load_full() else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "sbom-required");
     };
-    Json(remediation::report(&policy.report)).into_response()
+    Json(state.remediation(&policy.report)).into_response()
 }
 
 fn persist(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -421,38 +454,20 @@ async fn install(
         .ai
         .enhance(&mut policy, ai::ReviewTrigger::SbomUpdate)
         .await;
+    state.traffic.observe(&policy.report).await;
     let policy = Arc::new(policy);
     state.policy.store(Some(policy.clone()));
-    if let Some(notifier) = &state.webhook {
-        notifier.notify(&policy.report, ai::ReviewTrigger::SbomUpdate);
-    }
+    state.notify("sbom_update");
     Ok(policy)
 }
 
 async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Response {
-    if request.headers().contains_key(header::CONTENT_ENCODING) {
-        return error(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "encoded-sbom-not-supported",
-        );
-    }
     let Ok(update_guard) = state.updates.clone().try_lock_owned() else {
         return error(StatusCode::CONFLICT, "sbom-update-in-progress");
     };
-    let bytes = match tokio::time::timeout(
-        Duration::from_secs(state.config.timeout_secs),
-        to_bytes(request.into_body(), sbom::MAX_SBOM_BYTES),
-    )
-    .await
-    {
-        Ok(Ok(bytes)) => bytes,
-        Ok(Err(_)) => {
-            return error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "invalid-or-oversized-sbom-body",
-            );
-        }
-        Err(_) => return error(StatusCode::REQUEST_TIMEOUT, "sbom-upload-timeout"),
+    let bytes = match read_sbom(&state, request).await {
+        Ok(bytes) => bytes,
+        Err((status, code)) => return error(status, code),
     };
     let result = tokio::spawn(install(state, bytes, update_guard)).await;
     match result {
@@ -470,6 +485,34 @@ async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Respons
         }
         Err(_) => error(StatusCode::INTERNAL_SERVER_ERROR, "sbom-update-failed"),
     }
+}
+
+async fn read_sbom(
+    state: &AppState,
+    request: Request,
+) -> std::result::Result<axum::body::Bytes, (StatusCode, &'static str)> {
+    if request.headers().contains_key(header::CONTENT_ENCODING) {
+        return Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "encoded-sbom-not-supported",
+        ));
+    }
+    let bytes = match tokio::time::timeout(
+        Duration::from_secs(state.config.timeout_secs),
+        to_bytes(request.into_body(), sbom::MAX_SBOM_BYTES),
+    )
+    .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(_)) => {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "invalid-or-oversized-sbom-body",
+            ));
+        }
+        Err(_) => return Err((StatusCode::REQUEST_TIMEOUT, "sbom-upload-timeout")),
+    };
+    Ok(bytes)
 }
 
 #[cfg(test)]

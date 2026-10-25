@@ -50,6 +50,9 @@ spec:
             # Expired component reviews are automatically rechecked once a day.
             - name: FILTR_AI_CACHE_TTL_SECS
               value: "86400"
+            # Availability-oriented default; critical emergency escalation is opt-in.
+            - name: FILTR_AUTO_BLOCK_CRITICAL
+              value: "false"
             # Optionally add FILTR_AI_MODEL here to pin a native provider model.
             # Optional SRE notifications: add FILTR_WEBHOOK_URL and
             # FILTR_WEBHOOK_TIMEOUT_SECS; load FILTR_WEBHOOK_TOKEN from a Secret.

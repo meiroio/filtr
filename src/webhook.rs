@@ -1,4 +1,4 @@
-use crate::{ai::ReviewTrigger, network, policy::Report, remediation};
+use crate::network;
 use anyhow::{Context, Result, ensure};
 use axum::{body::Bytes, http::HeaderValue};
 use clap::Args;
@@ -89,6 +89,8 @@ impl Notifier {
                     "blockers": report["blockers"],
                     "inventory_gaps": report["inventory_gaps"],
                     "ai_status": report["ai_review"]["status"],
+                    "uncovered_vulnerabilities": report["uncovered_vulnerabilities"],
+                    "traffic": report["traffic"],
                 });
                 if key == previous {
                     continue;
@@ -108,26 +110,19 @@ impl Notifier {
                     "upstream": upstream,
                     "remediation": report,
                 });
-                let bytes =
-                    Bytes::from(serde_json::to_vec(&payload).expect("JSON value serializes"));
+                let Ok(bytes) = serde_json::to_vec(&payload) else {
+                    tracing::error!(event_id, "cannot serialize webhook; notification dropped");
+                    continue;
+                };
+                let bytes = Bytes::from(bytes);
                 deliver(&client, &url, authorization.as_ref(), &event_id, bytes).await;
             }
         });
         Ok(Some(Self { sender }))
     }
 
-    pub(crate) fn notify(&self, policy: &Report, trigger: ReviewTrigger) {
-        let trigger = match trigger {
-            ReviewTrigger::SbomUpdate => "sbom_update",
-            ReviewTrigger::Startup => "startup",
-            ReviewTrigger::Refresh => "manual_refresh",
-            ReviewTrigger::Expired => "cache_expired",
-        };
-        if self
-            .sender
-            .try_send((remediation::report(policy), trigger))
-            .is_err()
-        {
+    pub(crate) fn notify(&self, report: Value, trigger: &'static str) {
+        if self.sender.try_send((report, trigger)).is_err() {
             tracing::warn!("webhook queue unavailable; notification dropped");
         }
     }

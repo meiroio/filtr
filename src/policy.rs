@@ -1,10 +1,10 @@
 use crate::sbom::{self, Component};
 use aho_corasick::AhoCorasick;
 use anyhow::{Context, Result, ensure};
-use axum::http::Method;
+use axum::http::{HeaderMap, HeaderName, Method};
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::{borrow::Cow, collections::HashSet};
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -12,10 +12,155 @@ pub enum Action {
     DenyAll,
     DenyWrite,
     Tokens { patterns: Vec<String> },
+    Request { filter: RequestFilter },
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestFilter {
+    pub methods: Vec<String>,
+    pub path_prefix: String,
+    pub headers: Vec<HeaderMatch>,
+    pub body_patterns: Vec<String>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeaderMatch {
+    pub name: String,
+    pub value: String,
+    pub kind: HeaderMatchKind,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeaderMatchKind {
+    Exact,
+    Token,
+    Present,
+    MediaType,
+}
+
+impl RequestFilter {
+    pub(crate) fn validate(&self) -> Result<()> {
+        ensure!(
+            self.methods.len() <= 8 && self.headers.len() <= 8,
+            "too many request selectors"
+        );
+        ensure!(
+            self.methods.iter().all(|m| matches!(
+                m.as_str(),
+                "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE" | "OPTIONS"
+            )),
+            "unsupported request method"
+        );
+        ensure!(
+            self.path_prefix.len() <= 512
+                && self.path_prefix.is_ascii()
+                && (self.path_prefix.is_empty() || self.path_prefix.starts_with('/'))
+                && !self
+                    .path_prefix
+                    .bytes()
+                    .any(|b| b.is_ascii_control() || b"%\\?#".contains(&b)),
+            "invalid path selector"
+        );
+        ensure!(
+            (!self.path_prefix.is_empty() && self.path_prefix != "/")
+                || !self.headers.is_empty()
+                || !self.body_patterns.is_empty(),
+            "request rule must have a narrow selector beyond method alone"
+        );
+        for header in &self.headers {
+            HeaderName::from_bytes(header.name.as_bytes())
+                .context("invalid header selector name")?;
+            ensure!(
+                !matches!(header.kind, HeaderMatchKind::MediaType)
+                    || header.name.eq_ignore_ascii_case("content-type"),
+                "media_type selectors require Content-Type"
+            );
+            ensure!(
+                header.value.len() <= 256
+                    && header.value.is_ascii()
+                    && !header.value.bytes().any(|b| b.is_ascii_control()),
+                "invalid header selector value"
+            );
+            ensure!(
+                match header.kind {
+                    HeaderMatchKind::Present => header.value.is_empty(),
+                    _ => !header.value.is_empty(),
+                },
+                "header selector needs a value, except for presence checks"
+            );
+            ensure!(
+                !matches!(header.kind, HeaderMatchKind::Present)
+                    || !matches!(
+                        header.name.to_ascii_lowercase().as_str(),
+                        "host"
+                            | "content-length"
+                            | "content-type"
+                            | "accept"
+                            | "accept-encoding"
+                            | "user-agent"
+                            | "connection"
+                            | "authorization"
+                            | "cookie"
+                    ),
+                "presence of a common header is not a narrow restriction"
+            );
+            ensure!(
+                !header.name.to_ascii_lowercase().starts_with("x-forwarded-")
+                    && !matches!(
+                        header.name.to_ascii_lowercase().as_str(),
+                        "forwarded" | "alt-svc"
+                    ),
+                "forwarding headers cannot establish transport exposure"
+            );
+        }
+        if !self.body_patterns.is_empty() {
+            Action::Tokens {
+                patterns: self.body_patterns.clone(),
+            }
+            .validate()?;
+        }
+        Ok(())
+    }
+
+    fn matches_scope(&self, method: &Method, path: &[u8], headers: &HeaderMap) -> bool {
+        (self.methods.is_empty() || self.methods.iter().any(|m| m == method.as_str()))
+            && (self.path_prefix.is_empty() || path.starts_with(self.path_prefix.as_bytes()))
+            && self.headers.iter().all(|selector| {
+                headers
+                    .get_all(selector.name.as_str())
+                    .iter()
+                    .any(|value| match selector.kind {
+                        HeaderMatchKind::Present => true,
+                        HeaderMatchKind::Exact => value
+                            .as_bytes()
+                            .eq_ignore_ascii_case(selector.value.as_bytes()),
+                        HeaderMatchKind::Token => {
+                            value.as_bytes().split(|b| *b == b',').any(|part| {
+                                part.trim_ascii()
+                                    .eq_ignore_ascii_case(selector.value.as_bytes())
+                            })
+                        }
+                        HeaderMatchKind::MediaType => value
+                            .as_bytes()
+                            .split(|b| *b == b';')
+                            .next()
+                            .is_some_and(|part| {
+                                part.trim_ascii()
+                                    .eq_ignore_ascii_case(selector.value.as_bytes())
+                            }),
+                    })
+            })
+    }
 }
 
 impl Action {
     pub(crate) fn validate(&self) -> Result<()> {
+        if let Self::Request { filter } = self {
+            filter.validate()?;
+        }
         if let Self::Tokens { patterns } = self {
             ensure!(
                 !patterns.is_empty()
@@ -27,6 +172,10 @@ impl Action {
             );
         }
         Ok(())
+    }
+
+    pub(crate) fn targeted(&self) -> bool {
+        matches!(self, Self::Tokens { .. } | Self::Request { .. })
     }
 }
 
@@ -113,6 +262,58 @@ impl Catalog {
         Self::parse(include_bytes!("../rules/default.json"))
     }
 
+    fn coverage(&self, component: Component) -> Coverage {
+        let parsed = component.version.as_deref().and_then(version);
+        // Unknown and prerelease versions activate matching rules conservatively.
+        let uncertain = parsed.as_ref().is_none_or(|v| !v.pre.is_empty());
+        let relevant: Vec<_> = self
+            .rules
+            .iter()
+            .filter(|r| {
+                component
+                    .package
+                    .as_ref()
+                    .is_some_and(|p| r.spec.packages.contains(p))
+            })
+            .collect();
+        let matched: Vec<_> = relevant
+            .iter()
+            .filter(|r| {
+                uncertain
+                    || parsed
+                        .as_ref()
+                        .is_some_and(|v| r.ranges.iter().any(|range| range.matches(v)))
+            })
+            .collect();
+        let active_rules: Vec<_> = matched
+            .iter()
+            .filter(|r| r.spec.action.targeted())
+            .map(|r| r.spec.id.clone())
+            .collect();
+        let advisory_rules: Vec<_> = matched
+            .iter()
+            .filter(|r| !r.spec.action.targeted())
+            .map(|r| r.spec.id.clone())
+            .collect();
+        let status = if relevant.is_empty() {
+            "no_catalogue_rule"
+        } else if !advisory_rules.is_empty() && active_rules.is_empty() {
+            "advisory_only"
+        } else if uncertain {
+            "unknown_version_rules_enabled"
+        } else if active_rules.is_empty() {
+            "outside_catalogued_ranges"
+        } else {
+            "rules_enabled"
+        };
+        Coverage {
+            component,
+            status,
+            active_rules,
+            advisory_rules,
+        }
+    }
+
     pub fn specs(&self) -> Vec<&RuleSpec> {
         self.rules.iter().map(|r| &r.spec).collect()
     }
@@ -124,6 +325,8 @@ pub struct Coverage {
     pub component: Component,
     pub status: &'static str,
     pub active_rules: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub advisory_rules: Vec<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -131,6 +334,7 @@ pub struct Report {
     pub components: Vec<Coverage>,
     pub inventory_gaps: Vec<crate::ai::research::InventoryGap>,
     pub active_rules: Vec<RuleSpec>,
+    pub advisory_rules: Vec<RuleSpec>,
     pub generated_rules: Vec<crate::generated::Rule>,
     pub ai: crate::ai::Review,
     pub warning: &'static str,
@@ -141,6 +345,7 @@ pub struct Policy {
     pub report: Report,
     matcher: Option<AhoCorasick>,
     token_rules: Vec<String>,
+    request_rules: Vec<(String, RequestFilter, Option<AhoCorasick>)>,
 }
 
 fn version(value: &str) -> Option<Version> {
@@ -156,46 +361,13 @@ fn version(value: &str) -> Option<Version> {
 impl Policy {
     pub fn compile(components: Vec<Component>, catalog: &Catalog) -> Result<Self> {
         let mut activated = HashSet::new();
+        let mut advisory = HashSet::new();
         let mut coverage = Vec::new();
         for component in components {
-            let parsed = component.version.as_deref().and_then(version);
-            // Unknown and prerelease versions activate matching rules conservatively.
-            let uncertain = parsed.as_ref().is_none_or(|v| !v.pre.is_empty());
-            let relevant: Vec<_> = catalog
-                .rules
-                .iter()
-                .filter(|r| {
-                    component
-                        .package
-                        .as_ref()
-                        .is_some_and(|p| r.spec.packages.contains(p))
-                })
-                .collect();
-            let active_rules: Vec<_> = relevant
-                .iter()
-                .filter(|r| {
-                    uncertain
-                        || parsed
-                            .as_ref()
-                            .is_some_and(|v| r.ranges.iter().any(|range| range.matches(v)))
-                })
-                .map(|r| r.spec.id.clone())
-                .collect();
-            activated.extend(active_rules.iter().cloned());
-            let status = if relevant.is_empty() {
-                "no_catalogue_rule"
-            } else if uncertain {
-                "unknown_version_rules_enabled"
-            } else if active_rules.is_empty() {
-                "outside_catalogued_ranges"
-            } else {
-                "rules_enabled"
-            };
-            coverage.push(Coverage {
-                component,
-                status,
-                active_rules,
-            });
+            let item = catalog.coverage(component);
+            activated.extend(item.active_rules.iter().cloned());
+            advisory.extend(item.advisory_rules.iter().cloned());
+            coverage.push(item);
         }
         let active_rules: Vec<_> = catalog
             .rules
@@ -208,12 +380,19 @@ impl Policy {
                 inventory_gaps: crate::ai::research::inventory_gaps(&coverage),
                 components: coverage,
                 active_rules,
+                advisory_rules: catalog
+                    .rules
+                    .iter()
+                    .filter(|r| advisory.contains(&r.spec.id))
+                    .map(|r| r.spec.clone())
+                    .collect(),
                 generated_rules: Vec::new(),
                 ai: crate::ai::Review::default(),
-                warning: "Static mappings remain active while AI is missing, pending or failed. Generated restrictions activate only after a successful AI review and can quarantine this entire upstream. Vulnerability discovery is AI-assessed and non-exhaustive. Missing identities or versions and unreported CVEs remain unknown; payload rules do not prove protection.",
+                warning: "Targeted rules filter matching requests. Findings without a supported narrow rule remain advisory-only and do not stop unrelated traffic. Full blocking is controlled separately by the traffic-mode API and optional critical-risk automation. AI discovery is non-exhaustive; uncovered findings and inventory gaps require SRE action.",
             },
             matcher: None,
             token_rules: Vec::new(),
+            request_rules: Vec::new(),
         };
         policy.rebuild_matcher()?;
         Ok(policy)
@@ -229,6 +408,10 @@ impl Policy {
             .collect();
         for rule in rules {
             rule.action.validate()?;
+            ensure!(
+                rule.action.targeted(),
+                "generated rules must target requests; full blocking uses traffic control"
+            );
             ensure!(ids.insert(rule.id.clone()), "duplicate generated rule ID");
             candidate.report.generated_rules.push(rule);
         }
@@ -251,7 +434,25 @@ impl Policy {
             );
         let mut patterns = Vec::new();
         self.token_rules.clear();
+        self.request_rules.clear();
         for (id, action) in rules {
+            if let Action::Request { filter } = action {
+                ensure!(
+                    self.request_rules.len() < 128,
+                    "too many scoped request rules"
+                );
+                let matcher = if filter.body_patterns.is_empty() {
+                    None
+                } else {
+                    Some(
+                        AhoCorasick::builder()
+                            .ascii_case_insensitive(true)
+                            .build(&filter.body_patterns)?,
+                    )
+                };
+                self.request_rules
+                    .push((id.clone(), filter.clone(), matcher));
+            }
             if let Action::Tokens { patterns: tokens } = action {
                 for token in tokens {
                     patterns.push(token);
@@ -271,24 +472,37 @@ impl Policy {
         Ok(())
     }
 
-    pub fn inspect_method(&self, method: &Method) -> Option<&str> {
-        self.report
-            .active_rules
-            .iter()
-            .map(|r| (&r.id, &r.action))
-            .chain(
-                self.report
-                    .generated_rules
-                    .iter()
-                    .map(|r| (&r.id, &r.action)),
-            )
-            .find_map(|(id, action)| match action {
-                Action::DenyAll => Some(id.as_str()),
-                Action::DenyWrite if method != Method::GET && method != Method::HEAD => {
-                    Some(id.as_str())
-                }
-                _ => None,
-            })
+    pub fn inspect_request(
+        &self,
+        method: &Method,
+        path: &str,
+        headers: &HeaderMap,
+        body: &[u8],
+    ) -> Option<&str> {
+        if self.request_rules.is_empty() {
+            return None;
+        }
+        let paths = decoded_views(path.as_bytes());
+        let mut bodies = None;
+        for (id, filter, matcher) in &self.request_rules {
+            if !paths
+                .iter()
+                .any(|path| filter.matches_scope(method, path, headers))
+            {
+                continue;
+            }
+            let Some(matcher) = matcher else {
+                return Some(id);
+            };
+            if bodies
+                .get_or_insert_with(|| decoded_views(body))
+                .iter()
+                .any(|body| matcher.is_match(body))
+            {
+                return Some(id);
+            }
+        }
+        None
     }
 
     fn scan(&self, bytes: &[u8], target: bool) -> Option<&str> {
@@ -335,6 +549,22 @@ impl Policy {
     }
 }
 
+fn decoded_views(bytes: &[u8]) -> Vec<Cow<'_, [u8]>> {
+    let mut views = vec![Cow::Borrowed(bytes)];
+    for _ in 0..4 {
+        let Some(previous) = views.last() else { break };
+        if !previous.contains(&b'%') && !previous.contains(&b'\\') {
+            break;
+        }
+        let decoded = decode(previous);
+        if decoded == previous.as_ref() {
+            break;
+        }
+        views.push(Cow::Owned(decoded));
+    }
+    views
+}
+
 fn hex(byte: u8) -> Option<u32> {
     (byte as char).to_digit(16)
 }
@@ -378,6 +608,97 @@ fn decode(bytes: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_filters_and_all_selectors_and_decode_body_and_paths() {
+        let filter = RequestFilter {
+            methods: vec!["POST".into()],
+            path_prefix: "/admin".into(),
+            headers: vec![HeaderMatch {
+                name: "x-action".into(),
+                kind: HeaderMatchKind::Exact,
+                value: "upload".into(),
+            }],
+            body_patterns: vec!["EXPLOIT".into()],
+        };
+        let mut policy = log4j("2.26.0");
+        policy
+            .add_generated(vec![crate::generated::Rule {
+                id: "test-scoped".into(),
+                origin: "ai_discovery",
+                package: "pkg:npm/test".into(),
+                version: Some("1.0.0".into()),
+                basis: "test".into(),
+                cves: vec![],
+                action: Action::Request {
+                    filter: filter.clone(),
+                },
+                description: "test".into(),
+                source: "https://example.invalid/test".into(),
+            }])
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-action", "UPLOAD".parse().unwrap());
+        assert_eq!(
+            policy.inspect_request(&Method::POST, "/%61dmin/files", &headers, b"%45XPLOIT"),
+            Some("test-scoped")
+        );
+        for (method, path, body) in [
+            (Method::GET, "/admin", b"EXPLOIT".as_slice()),
+            (Method::POST, "/other", b"EXPLOIT"),
+            (Method::POST, "/admin", b"ordinary"),
+        ] {
+            assert!(
+                policy
+                    .inspect_request(&method, path, &headers, body)
+                    .is_none()
+            );
+        }
+        assert!(
+            policy
+                .inspect_request(&Method::POST, "/admin", &HeaderMap::new(), b"EXPLOIT")
+                .is_none()
+        );
+        let mut token = filter;
+        token.methods.clear();
+        token.path_prefix.clear();
+        token.body_patterns.clear();
+        token.headers = vec![HeaderMatch {
+            name: "content-encoding".into(),
+            kind: HeaderMatchKind::Token,
+            value: "br".into(),
+        }];
+        headers.insert("content-encoding", "gzip, BR".parse().unwrap());
+        assert!(token.matches_scope(&Method::POST, b"/", &headers));
+        headers.insert("content-encoding", "zebra".parse().unwrap());
+        assert!(!token.matches_scope(&Method::POST, b"/", &headers));
+        token.headers = vec![HeaderMatch {
+            name: "content-type".into(),
+            kind: HeaderMatchKind::MediaType,
+            value: "multipart/form-data".into(),
+        }];
+        headers.insert(
+            "content-type",
+            "Multipart/Form-Data; boundary=test".parse().unwrap(),
+        );
+        assert!(token.matches_scope(&Method::POST, b"/", &headers));
+        headers.insert("content-type", "application/json".parse().unwrap());
+        assert!(!token.matches_scope(&Method::POST, b"/", &headers));
+        token.headers.clear();
+        assert!(token.validate().is_err());
+        token.headers = vec![HeaderMatch {
+            name: "host".into(),
+            kind: HeaderMatchKind::Present,
+            value: String::new(),
+        }];
+        assert!(token.validate().is_err());
+        token.headers = vec![HeaderMatch {
+            name: "x-forwarded-proto".into(),
+            kind: HeaderMatchKind::Exact,
+            value: "h3".into(),
+        }];
+        assert!(token.validate().is_err());
+    }
 
     fn log4j(version: &str) -> Policy {
         Policy::compile(
@@ -437,7 +758,7 @@ mod tests {
     }
 
     #[test]
-    fn rsc_uses_precise_ranges_and_blocks_every_non_read_method() {
+    fn broad_rsc_catalogue_rules_are_advisory_only() {
         for (version, active) in [
             ("19.0.0", true),
             ("19.1.1", true),
@@ -457,8 +778,15 @@ mod tests {
                 &Catalog::bundled().unwrap(),
             )
             .unwrap();
-            assert_eq!(p.inspect_method(&Method::POST).is_some(), active);
-            assert!(p.inspect_method(&Method::GET).is_none());
+            assert_eq!(!p.report.advisory_rules.is_empty(), active);
+            assert!(
+                p.inspect_request(&Method::POST, "/", &HeaderMap::new(), &[])
+                    .is_none()
+            );
+            assert!(
+                p.inspect_request(&Method::GET, "/", &HeaderMap::new(), &[])
+                    .is_none()
+            );
         }
     }
 
@@ -477,11 +805,11 @@ mod tests {
             &catalog,
         )
         .unwrap();
-        assert_eq!(p.inspect_method(&Method::GET), Some("emergency"));
         assert_eq!(
-            p.report.components[0].status,
-            "unknown_version_rules_enabled"
+            p.inspect_request(&Method::GET, "/", &HeaderMap::new(), &[]),
+            None
         );
+        assert_eq!(p.report.components[0].status, "advisory_only");
         assert!(Catalog::parse(br#"{"version":2,"rules":[]}"#).is_err());
     }
 }

@@ -1,6 +1,6 @@
 use super::{
-    AiConfig, INSTRUCTIONS, Proposal, Reply, ReviewTrigger, ReviewedBatch, batches, models::Target,
-    output_schema, research,
+    AiConfig, INSTRUCTIONS, LEGACY_INSTRUCTIONS, Proposal, Reply, ReviewTrigger, ReviewedBatch,
+    batches, legacy_output_schema, models::Target, output_schema, research,
 };
 use crate::policy::Report;
 use anyhow::{Context, Result, ensure};
@@ -43,6 +43,7 @@ pub(super) struct Store {
     keys: BTreeMap<usize, String>,
     aliases: BTreeMap<usize, Vec<usize>>,
     pub missing: BTreeSet<usize>,
+    read_only: bool,
 }
 
 pub(super) fn now() -> Result<u64> {
@@ -60,9 +61,17 @@ pub(super) async fn clear(path: &Path) -> Result<()> {
 }
 
 fn scope(config: &AiConfig) -> Value {
-    json!({"version":1,"instructions":INSTRUCTIONS,"schema":output_schema(),
+    json!({"version":2,"instructions":INSTRUCTIONS,"schema":output_schema(),
         "provider":config.provider,"model":config.model,"reasoning":config.reasoning,
         "openai_url":config.url.as_str(),"anthropic_url":config.anthropic_url.as_str()})
+}
+
+fn legacy_scope(config: &AiConfig) -> Value {
+    let mut previous = scope(config);
+    previous["version"] = json!(1);
+    previous["instructions"] = json!(LEGACY_INSTRUCTIONS);
+    previous["schema"] = legacy_output_schema();
+    previous
 }
 
 fn component_key(report: &Report, index: usize) -> Result<String> {
@@ -101,7 +110,13 @@ fn component_reply(reply: &Reply, index: usize, destination: usize) -> Reply {
         .collect();
     Reply {
         summary: "Reused a completed component review; see cache timestamps for its age.".into(),
-        sources: discoveries.iter().map(|d| d.source.clone()).collect(),
+        sources: discoveries
+            .iter()
+            .flat_map(|d| {
+                std::iter::once(d.source.clone())
+                    .chain(d.emergency.as_ref().map(|e| e.source.clone()))
+            })
+            .collect(),
         enhancements,
         discoveries,
         usage: research::Usage::default(),
@@ -116,7 +131,7 @@ impl Store {
         }
         let enabled = config.cache_ttl_secs > 0;
         let expected = scope(config);
-        let data = tokio::task::spawn_blocking(move || -> Result<Data> {
+        let mut data = tokio::task::spawn_blocking(move || -> Result<Data> {
             if !enabled {
                 return Ok(Data::default());
             }
@@ -140,6 +155,18 @@ impl Store {
             data.entries.len() <= 50_000,
             "AI cache exceeds 50,000 entries"
         );
+        // Old findings retain their age, but old broad enhancements never become new restrictions.
+        if data.scope == legacy_scope(config) {
+            for entry in data.entries.values_mut() {
+                entry.reply.enhancements.clear();
+                for finding in &mut entry.reply.discoveries {
+                    finding.restriction = None;
+                    finding.emergency = None;
+                    finding.coverage_note = "Legacy cached finding: advisory only; no narrow mitigation was reviewed. Re-evaluate at normal expiry or request an explicit refresh.".into();
+                }
+            }
+            data.scope = expected.clone();
+        }
         let data = if data.scope == expected {
             data
         } else {
@@ -154,6 +181,7 @@ impl Store {
             keys: BTreeMap::new(),
             aliases: BTreeMap::new(),
             missing: BTreeSet::new(),
+            read_only: matches!(trigger, ReviewTrigger::Preview { cache_only: true }),
         })
     }
 
@@ -175,7 +203,10 @@ impl Store {
                     reply
                         .discoveries
                         .iter()
-                        .all(|d| entry.sources.contains(&d.source)),
+                        .all(|d| entry.sources.contains(&d.source)
+                            && d.emergency
+                                .as_ref()
+                                .is_none_or(|e| entry.sources.contains(&e.source))),
                     "cached discovery lacks source evidence; use POST /v1/refresh"
                 );
                 reply.sources = entry.sources.clone();
@@ -241,7 +272,7 @@ impl Store {
                 .models
                 .insert(format!("{prefix}/{}", completed.target.model));
         }
-        if self.ttl == 0 {
+        if self.ttl == 0 || self.read_only || !matches!(review.status, super::Status::Complete) {
             return;
         }
         if !self.missing.is_empty()
@@ -276,7 +307,10 @@ impl Store {
                 .context("AI cache component review missing")?;
             let reply = component_reply(&completed.reply, index, 0);
             self.data.entries.insert(
-                self.keys[&index].clone(),
+                self.keys
+                    .get(&index)
+                    .context("AI cache component key missing")?
+                    .clone(),
                 Entry {
                     checked_at,
                     target: completed.target.clone(),
@@ -319,6 +353,39 @@ impl Store {
 mod tests {
     use super::super::{Review, Status};
     use super::*;
+
+    #[tokio::test]
+    async fn legacy_reviews_retain_age_and_findings_but_never_broad_actions() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache.json");
+        let config = AiConfig::default();
+        let policy = policy("2.14.1");
+        let checked = now().unwrap();
+        let key = component_key(&policy.report, 0).unwrap();
+        let document = json!({"scope":legacy_scope(&config),"entries":{key:{"checked_at":checked,
+            "target":{"provider":"openai","model":"old-model","reasoning":"default","rank":null},
+            "sources":["https://vendor.example/advisory"],
+            "reply":{"summary":"old finding","enhancements":[{"component_index":0,"basis":"log4shell-lookups","action":"deny_all","patterns":[],"reason":"legacy quarantine"}],
+                "discoveries":[{"component_index":0,"cve":"CVE-2026-12345","source":"https://vendor.example/advisory","reason":"old evidence","fixed_version":"2.26.0"}]}}}});
+        std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut store = Store::load(&path, &config, ReviewTrigger::Preview { cache_only: true })
+            .await
+            .unwrap();
+        let mut stats = Stats::default();
+        let replies = store.reuse(&policy.report, &mut stats).unwrap();
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.oldest_checked_at, Some(checked));
+        assert!(replies[0].reply.enhancements.is_empty());
+        assert!(replies[0].reply.discoveries[0].restriction.is_none());
+        assert!(replies[0].reply.discoveries[0].emergency.is_none());
+        assert!(
+            replies[0].reply.discoveries[0]
+                .coverage_note
+                .contains("Legacy")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
 
     fn policy(version: &str) -> crate::policy::Policy {
         let document = json!({"format":"filtr-1","packages":[{"purl":format!("pkg:maven/org.apache.logging.log4j/log4j-core@{version}")}]});
