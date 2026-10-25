@@ -63,4 +63,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ github.ref_name }}
-        run: gh release create "$VERSION" dist/* --verify-tag --title "Filtr $VERSION" --notes-file .github/release-notes.md
+        run: |
+          cp deploy/kubernetes/filtr.yaml "dist/filtr-$VERSION-kubernetes.yaml"
+          gh release create "$VERSION" dist/* --verify-tag --title "Filtr $VERSION" --notes-file .github/release-notes.md

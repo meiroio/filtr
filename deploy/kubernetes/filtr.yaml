@@ -37,8 +37,9 @@ spec:
           type: RuntimeDefault
       containers:
         - name: filtr
-          # Replace with your own built image, preferably pinned by digest.
-          image: ghcr.io/your-org/filtr:0.1.0
+          # Public multi-architecture image: linux/amd64 and linux/arm64.
+          # Pin its manifest digest for immutable production deployments.
+          image: ghcr.io/meiroio/filtr:0.1.0
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
