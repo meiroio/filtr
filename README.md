@@ -175,29 +175,36 @@ Without a model override, valid SBOM uploads refresh leaderboard selection. Prev
 
 ## Performance
 
-Local Docker benchmark of the published **Filtr 0.1.0, native arm64**, measured on 2026-10-25: Apple M4 with 32 GiB RAM; Docker Engine 29.8.2 in a 10-vCPU, 15.6-GiB Docker Desktop VM. Filtr had a **2-CPU quota and 512 MiB limit**. The demo origin and oha 1.16.0 load generator ran in separate containers, each with a 2-CPU quota. Baseline guards and one curated Log4j rule were active; AI analysis was disabled.
+A paired local Docker benchmark on **2026-10-25, native arm64**, compares the published **Filtr 0.1.0** with the optimized source build. Hardware: Apple M4 with 32 GiB RAM; Docker Engine 29.8.2 in a 10-vCPU, 15.6-GiB Docker Desktop VM. Both Filtr variants had a **2-CPU quota and 512 MiB limit**, the same baseline guards and one curated Log4j rule. They shared a demo origin and were loaded separately. AI analysis was disabled.
 
-HTTP/1.1, no TLS, 64 keep-alive connections, three 15-second runs per workload after a three-second warm-up. Throughput and latency columns are medians of the individual runs; p99 is the median of three per-run p99 values.
+HTTP/1.1, no TLS, 64 keep-alive connections, three 15-second runs per workload after a three-second warm-up. Baseline/candidate order reverses between rounds. The table shows median throughput and optimized latency; p99 is the median of three per-run p99 values.
 
-| Workload | Direct origin, req/s | Through Filtr, req/s | Filtr p50 | Filtr p99 |
-| --- | ---: | ---: | ---: | ---: |
-| GET, small JSON response | 308,899 | 54,884 | 1.12 ms | 2.33 ms |
-| POST, 1 KiB JSON body | 324,308 | 54,227 | 1.12 ms | 2.41 ms |
-| POST, 64 KiB JSON body | 135,971 | 31,360 | 1.90 ms | 5.48 ms |
-| Lookup header, blocked with 403 | — | 254,429 | 0.24 ms | 0.62 ms |
+| Workload | Direct origin, req/s | Released 0.1.0, req/s | Optimized source, req/s | Throughput change | Optimized p50 | Optimized p99 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| GET, small JSON response | 281,779 | 49,764 | 54,937 | +10.4% | 1.13 ms | 2.21 ms |
+| POST, 1 KiB JSON body | 264,391 | 46,238 | 51,722 | +11.9% | 1.19 ms | 2.42 ms |
+| POST, 64 KiB JSON body | 113,165 | 26,282 | 30,453 | +15.9% | 2.02 ms | 4.27 ms |
+| Lookup header, blocked with 403 | — | 219,303 | 220,674 | +0.6% | 0.28 ms | 0.67 ms |
 
-All measured benign requests returned 200; the blocking case returned 403. There were no connection or upstream errors. Blocking responses do not reach the origin. Filtr GET throughput ranged from 50,328 to 67,696 req/s across runs, reflecting variation on this shared development host. The direct comparison includes the cost of the extra HTTP proxy hop and inspection. These closed-loop measurements with a trivial origin are a development reference, not a production capacity or latency-SLA guarantee; TLS, real application work, large generated policies and AI review cost are outside this test.
+These are **fresh paired controls**, not a comparison against the [earlier standalone run](https://github.com/meiroio/filtr/blob/main/bench/results/2026-10-25-arm64.json). All benign requests returned 200 and the blocking cases returned 403, with no connection or upstream errors. Optimized GET throughput ranged from 54,152 to 71,842 req/s on this shared development host. Blocking performance was similar between variants; per-run ranges and both variants' latency figures are in the [complete results](https://github.com/meiroio/filtr/blob/main/bench/results/2026-10-25-optimized-paired-arm64.json).
 
-Reproduce from the [benchmark source](https://github.com/meiroio/filtr/tree/main/bench), using Docker Compose and Python 3:
+Linux perf profiles identified repeated byte scans, URL parsing and header allocation/copying. The optimized path combines NUL/escape detection, updates only the path/query of the validated upstream URL, and moves owned request/response headers. Filtering, decoding depth, limits, forwarding trust and traffic controls remain enforced. Validation passed 81 Rust tests plus 111 baseline/candidate HTTP cases with identical responses, including 83 rejections. First-party unsafe Rust remains forbidden. See the [profiling and validation summary](https://github.com/meiroio/filtr/blob/main/bench/results/2026-10-25-profile-arm64.json).
+
+The proxy still adds an HTTP hop and inspection. These closed-loop tests with a trivial origin are a development reference, not a production capacity or latency-SLA guarantee. TLS, real application work, large generated policies and AI review cost are outside this test. The optimized numbers describe a **source build**, rather than the released 0.1.0 image.
+
+Reproduce using Docker Compose and Python 3:
 
 ```sh
 git clone --depth 1 https://github.com/meiroio/filtr.git filtr-benchmark
 cd filtr-benchmark
-python3 bench/run.py --duration 15 --repeats 3 --connections 64 \
+docker build --target runtime -t filtr-benchmark:optimized .
+python3 bench/run.py --image filtr-benchmark:optimized \
+  --baseline-image ghcr.io/meiroio/filtr:0.1.0@sha256:5333b0a0101a08ee902c90e68bc36fa44eba1ec9948be050f65648837a52bc03 \
+  --duration 15 --repeats 3 --connections 64 \
   --host-description 'Describe your CPU and RAM' --output data/benchmark
 ```
 
-The harness pulls Filtr by digest, builds the demo/load-generator images, uses an isolated Docker network and makes no AI calls. See the [methodology](https://github.com/meiroio/filtr/blob/main/bench/README.md) and [per-run results](https://github.com/meiroio/filtr/blob/main/bench/results/2026-10-25-arm64.json). Local raw reports stay under ignored `data/`.
+The harness builds the demo/load-generator images, uses an isolated Docker network and makes no AI calls. Omitting `--image` retains the pinned released image; omitting `--baseline-image` runs a single variant. See the [methodology](https://github.com/meiroio/filtr/blob/main/bench/README.md). Local raw reports and profiles stay under ignored `data/`.
 
 ## Agent instructions: operate Filtr through its APIs
 

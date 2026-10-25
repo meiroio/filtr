@@ -121,7 +121,8 @@ def execute(args, output, input_dir):
     env = dict(os.environ, FILTR_ADMIN_TOKEN=secrets.token_hex(64), FILTR_BENCH_INPUT=str(input_dir),
                FILTR_BENCH_IMAGE=args.image, FILTR_BENCH_BASELINE_IMAGE=args.baseline_image or BASELINE_IMAGE)
     # Compose receives only explicitly declared container variables. Never load the project's .env.
-    compose = ["docker", "compose", "--env-file", "/dev/null", "--project-name",
+    compose = ["docker", "compose", "--env-file", "/dev/null",
+               *(["--profile", "comparison"] if args.baseline_image else []), "--project-name",
                f"filtr-bench-{secrets.token_hex(4)}", "--file", str(ROOT / "bench/compose.yaml")]
     compose = functools.partial(command, prefix=compose, env=env)
     try:
