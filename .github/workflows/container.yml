@@ -7,7 +7,7 @@ on:
       release_tag:
         description: Existing stable release tag to build
         required: true
-        default: v0.1.0
+        default: v0.1.1
 permissions:
   contents: read
   packages: write

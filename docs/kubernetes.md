@@ -2,18 +2,18 @@
 
 [Back to deployment choices](../README.md)
 
-The public image **`ghcr.io/meiroio/filtr:0.1.0`** supports **linux/amd64 and linux/arm64** under one multi-architecture tag. Nodes pull the appropriate image without registry credentials. Download the deployment manifest without cloning or building the project:
+The public image **`ghcr.io/meiroio/filtr:0.1.1`** supports **linux/amd64 and linux/arm64** under one multi-architecture tag. Nodes pull the appropriate image without registry credentials. Download the deployment manifest without cloning or building the project:
 
 ```sh
 set -eu
-mkdir filtr-kubernetes-v0.1.0
-cd filtr-kubernetes-v0.1.0
+mkdir filtr-kubernetes-v0.1.1
+cd filtr-kubernetes-v0.1.1
 curl --fail --location \
-  https://github.com/meiroio/filtr/releases/download/v0.1.0/filtr-v0.1.0-kubernetes.yaml \
+  https://github.com/meiroio/filtr/releases/download/v0.1.1/filtr-v0.1.1-kubernetes.yaml \
   --output filtr.yaml
 ```
 
-The manifest already uses the versioned image. `ghcr.io/meiroio/filtr:latest` tracks published stable releases; prefer a version or manifest digest for controlled deployments. To resolve a digest on a machine with Docker, run `docker buildx imagetools inspect ghcr.io/meiroio/filtr:0.1.0`, then set `image: ghcr.io/meiroio/filtr:0.1.0@sha256:THE_INDEX_DIGEST`. Use the top-level multi-architecture digest for a mixed cluster. Source builds remain an optional [development workflow](development.md#docker).
+The manifest already uses the versioned image. `ghcr.io/meiroio/filtr:latest` tracks published stable releases; prefer a version or manifest digest for controlled deployments. To resolve a digest on a machine with Docker, run `docker buildx imagetools inspect ghcr.io/meiroio/filtr:0.1.1`, then set `image: ghcr.io/meiroio/filtr:0.1.1@sha256:THE_INDEX_DIGEST`. Use the top-level multi-architecture digest for a mixed cluster. Source builds remain an optional [development workflow](development.md#docker).
 
 `filtr.yaml` supplies a Deployment, ClusterIP Service and 1 GiB persistent volume claim; its maintained source is [deploy/kubernetes/filtr.yaml](https://github.com/meiroio/filtr/blob/main/deploy/kubernetes/filtr.yaml). It does not create a public load balancer, ingress, certificate or network isolation rules. Edit the Deployment's `env` entry for `FILTR_UPSTREAM` to match your application Service. For example, `http://application.default.svc.cluster.local:3000` means Service `application`, namespace `default`, Service port `3000`. Use your cluster's storage class if it has no default. The examples below use the default namespace. The runtime uses a read-only root filesystem, drops capabilities, runs without root or a service-account token, and writes only to `/data`.
 
@@ -98,6 +98,6 @@ kubectl rollout status deployment/filtr --timeout=960s
 
 Use the same port-forward and upload command for subsequent releases. [Port forwarding](https://kubernetes.io/docs/tasks/access-application-cluster/port-forward-access-application-cluster/) requires the appropriate operator RBAC permissions. Never add the admin port to a Service or ingress. Route the existing ingress/TLS endpoint to Service `filtr:8080`, and restrict origin access so clients cannot bypass Filtr.
 
-The [authenticated exec probes](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/) run [deploy/probe.sh](https://github.com/meiroio/filtr/blob/v0.1.0/deploy/probe.sh) inside the pod, keeping the admin token out of curl's arguments. Startup/liveness check admin responsiveness without requiring an SBOM, so first-time installation does not cause restart loops. Readiness checks `/healthz` and succeeds once a policy is installed. It does not assess origin health or promise vulnerability coverage; deliberate quarantine is still a valid ready policy. The startup probe permits 960 seconds with the default AI deadline; increase its budget if you increase those deadlines. Tune resource requests/limits against your own traffic and inventory sizes.
+The [authenticated exec probes](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/) run [deploy/probe.sh](https://github.com/meiroio/filtr/blob/v0.1.1/deploy/probe.sh) inside the pod, keeping the admin token out of curl's arguments. Startup/liveness check admin responsiveness without requiring an SBOM, so first-time installation does not cause restart loops. Readiness checks `/healthz` and succeeds once a policy is installed. It does not assess origin health or promise vulnerability coverage; deliberate quarantine is still a valid ready policy. The startup probe permits 960 seconds with the default AI deadline; increase its budget if you increase those deadlines. Tune resource requests/limits against your own traffic and inventory sizes.
 
 This MVP uses **one replica with a Recreate strategy** and persistent storage so two pods cannot concurrently replace the same policy. Application updates therefore have an interruption. Do not enable an HPA or scale this Deployment without adding policy distribution/coordination; there is no multi-replica control plane. Deploy separate named instances/claims/Secrets for separate upstreams. Persist the entire `/data` directory: restarts reuse cached reviews and research only missing/expired entries using the saved leaderboard, without fetching rankings; a missing or incompatible snapshot uses the existing Luna/static fallback until the next SBOM upload.

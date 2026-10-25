@@ -7,7 +7,7 @@ python3 bench/run.py --duration 15 --repeats 3 --connections 64 \
   --host-description 'Describe your CPU and RAM' --output data/benchmark
 ```
 
-Use a new output directory for each run. The harness pulls the published Filtr 0.1.0 image by its multi-architecture manifest digest, builds the existing Rust demo origin and a checksum-verified oha 1.16.0 load-generator image, and creates a separate Compose project. Image builds/downloads require network access; measured HTTP requests remain inside its Docker network. It publishes no host ports, loads no project `.env`, passes no provider keys and removes its own containers/network afterward. Existing application containers are left running. The generated admin secret stays in the benchmark process/container environment and reaches curl through stdin.
+Use a new output directory for each run. The harness selects the current Filtr 0.1.1 release by default, builds the existing Rust demo origin and a checksum-verified oha 1.16.0 load-generator image, and creates a separate Compose project. Image builds/downloads require network access; measured HTTP requests remain inside its Docker network. It publishes no host ports, loads no project `.env`, passes no provider keys and removes its own containers/network afterward. Existing application containers are left running. The generated admin secret stays in the benchmark process/container environment and reaches curl through stdin.
 
 For a source build with freshly measured release controls:
 
@@ -18,7 +18,7 @@ python3 bench/run.py --image filtr-benchmark:optimized \
   --duration 15 --repeats 3 --connections 64 --output data/benchmark-paired
 ```
 
-`--image` selects the primary Filtr image; its default remains the pinned public 0.1.0 release. Optional `--baseline-image` starts a second Filtr with identical policy and limits against the same origin. Each baseline/candidate pair is measured back-to-back, with order reversed in alternate rounds; only one load generator runs at a time. The comparison has 11 workloads and 33 measured samples with the default three repetitions, so allow roughly ten minutes after builds. Image references/IDs and source revision are recorded. Local source images need to be built first; this command does not publish them or alter release tags.
+`--image` selects the primary Filtr image; its default is the current public 0.1.1 release. Optional `--baseline-image` starts a second Filtr with identical policy and limits against the same origin. Each baseline/candidate pair is measured back-to-back, with order reversed in alternate rounds; only one load generator runs at a time. The comparison has 11 workloads and 33 measured samples with the default three repetitions, so allow roughly ten minutes after builds. Image references/IDs and source revision are recorded. Local source images need to be built first; this command does not publish them or alter release tags.
 
 Each container has a 2-CPU quota and two runtime workers. Filtr has a 512 MiB memory limit, the origin has 256 MiB and the load generator has 2 GiB for its retained latency samples. Filtr uses its default HTTP limits and baseline guards, with the bundled Log4j 2.14.1 inventory enabling `log4shell-lookups`. This is a small static-policy workload; it does not measure large generated rule sets or paid inventory analysis.
 

@@ -39,7 +39,7 @@ spec:
         - name: filtr
           # Public multi-architecture image: linux/amd64 and linux/arm64.
           # Pin its manifest digest for immutable production deployments.
-          image: ghcr.io/meiroio/filtr:0.1.0
+          image: ghcr.io/meiroio/filtr:0.1.1
           imagePullPolicy: IfNotPresent
           ports:
             - name: http

@@ -4,7 +4,7 @@
 
 ## Apache and PHP
 
-Simple mode installs a prebuilt Linux binary, discovers the real inventory, uploads an SBOM and configures one Apache website. No Rust toolchain or UI is required. The [release workflow](https://github.com/meiroio/filtr/blob/v0.1.0/.github/workflows/release.yml) produces **amd64 and arm64** archives. Manual runs create build artifacts; version-tag builds publish archives and checksums on [GitHub Releases](https://github.com/meiroio/filtr/releases).
+Simple mode installs a prebuilt Linux binary, discovers the real inventory, uploads an SBOM and configures one Apache website. No Rust toolchain or UI is required. The [release workflow](https://github.com/meiroio/filtr/blob/v0.1.1/.github/workflows/release.yml) produces **amd64 and arm64** archives. Manual runs create build artifacts; version-tag builds publish archives and checksums on [GitHub Releases](https://github.com/meiroio/filtr/releases).
 
 Supported hosts are **Debian 12+ or Ubuntu 22.04+**, with distribution Apache2 packages, Python 3, systemd and CA certificates. The profile accepts one application virtual host on port 80 or 443, plus an optional simple HTTP-to-HTTPS redirect for that hostname. PHP can use enabled mod_php or a standard `/run/php/phpVERSION-fpm.sock` handler. Apache retains certificate ownership and renewal paths. Other sites remain outside this installation's protection.
 

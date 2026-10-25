@@ -17,20 +17,20 @@ For **Debian 12+ and Ubuntu 22.04+** hosts with Python 3, systemd, curl, CA cert
 
 ### Download
 
-Release **[v0.1.0](https://github.com/meiroio/filtr/releases/tag/v0.1.0)**:
+Release **[v0.1.1](https://github.com/meiroio/filtr/releases/tag/v0.1.1)**:
 
 | Linux architecture | Package | Checksum |
 | --- | --- | --- |
-| amd64 / x86_64 | [Download](https://github.com/meiroio/filtr/releases/download/v0.1.0/filtr-v0.1.0-linux-amd64.tar.gz) | [SHA-256](https://github.com/meiroio/filtr/releases/download/v0.1.0/filtr-v0.1.0-linux-amd64.tar.gz.sha256) |
-| arm64 / aarch64 | [Download](https://github.com/meiroio/filtr/releases/download/v0.1.0/filtr-v0.1.0-linux-arm64.tar.gz) | [SHA-256](https://github.com/meiroio/filtr/releases/download/v0.1.0/filtr-v0.1.0-linux-arm64.tar.gz.sha256) |
+| amd64 / x86_64 | [Download](https://github.com/meiroio/filtr/releases/download/v0.1.1/filtr-v0.1.1-linux-amd64.tar.gz) | [SHA-256](https://github.com/meiroio/filtr/releases/download/v0.1.1/filtr-v0.1.1-linux-amd64.tar.gz.sha256) |
+| arm64 / aarch64 | [Download](https://github.com/meiroio/filtr/releases/download/v0.1.1/filtr-v0.1.1-linux-arm64.tar.gz) | [SHA-256](https://github.com/meiroio/filtr/releases/download/v0.1.1/filtr-v0.1.1-linux-arm64.tar.gz.sha256) |
 
 Run on the target Debian/Ubuntu host, in a new directory:
 
 ```sh
 set -eu
-mkdir filtr-v0.1.0
-cd filtr-v0.1.0
-FILTR_VERSION=v0.1.0
+mkdir filtr-v0.1.1
+cd filtr-v0.1.1
+FILTR_VERSION=v0.1.1
 FILTR_ARCH=$(dpkg --print-architecture)
 case "$FILTR_ARCH" in amd64|arm64) ;; *) echo 'Supported architectures: amd64, arm64' >&2; exit 1;; esac
 FILTR_ARCHIVE="filtr-${FILTR_VERSION}-linux-${FILTR_ARCH}.tar.gz"
@@ -106,14 +106,14 @@ Deploy the same proxy in front of a private application Service. This mode uses 
 Existing HTTPS ingress → Filtr Service :8080 → private application Service
 ```
 
-Use the public image **`ghcr.io/meiroio/filtr:0.1.0`**, which supports **linux/amd64 and linux/arm64**. Kubernetes selects the node's architecture automatically; no registry login or local image build is needed. Download the release's deployment manifest:
+Use the public image **`ghcr.io/meiroio/filtr:0.1.1`**, which supports **linux/amd64 and linux/arm64**. Kubernetes selects the node's architecture automatically; no registry login or local image build is needed. Download the release's deployment manifest:
 
 ```sh
 set -eu
-mkdir filtr-kubernetes-v0.1.0
-cd filtr-kubernetes-v0.1.0
+mkdir filtr-kubernetes-v0.1.1
+cd filtr-kubernetes-v0.1.1
 curl --fail --location \
-  https://github.com/meiroio/filtr/releases/download/v0.1.0/filtr-v0.1.0-kubernetes.yaml \
+  https://github.com/meiroio/filtr/releases/download/v0.1.1/filtr-v0.1.1-kubernetes.yaml \
   --output filtr.yaml
 ```
 
@@ -175,7 +175,7 @@ Without a model override, valid SBOM uploads refresh leaderboard selection. Prev
 
 ## Performance
 
-A paired local Docker benchmark on **2026-10-25, native arm64**, compares the published **Filtr 0.1.0** with the optimized source build. Hardware: Apple M4 with 32 GiB RAM; Docker Engine 29.8.2 in a 10-vCPU, 15.6-GiB Docker Desktop VM. Both Filtr variants had a **2-CPU quota and 512 MiB limit**, the same baseline guards and one curated Log4j rule. They shared a demo origin and were loaded separately. AI analysis was disabled.
+A paired local Docker benchmark on **2026-10-25, native arm64**, compares the published **Filtr 0.1.0** with the optimized source build whose request-path changes are included in **v0.1.1**. Hardware: Apple M4 with 32 GiB RAM; Docker Engine 29.8.2 in a 10-vCPU, 15.6-GiB Docker Desktop VM. Both Filtr variants had a **2-CPU quota and 512 MiB limit**, the same baseline guards and one curated Log4j rule. They shared a demo origin and were loaded separately. AI analysis was disabled.
 
 HTTP/1.1, no TLS, 64 keep-alive connections, three 15-second runs per workload after a three-second warm-up. Baseline/candidate order reverses between rounds. The table shows median throughput and optimized latency; p99 is the median of three per-run p99 values.
 
@@ -190,21 +190,20 @@ These are **fresh paired controls**, not a comparison against the [earlier stand
 
 Linux perf profiles identified repeated byte scans, URL parsing and header allocation/copying. The optimized path combines NUL/escape detection, updates only the path/query of the validated upstream URL, and moves owned request/response headers. Filtering, decoding depth, limits, forwarding trust and traffic controls remain enforced. Validation passed 81 Rust tests plus 111 baseline/candidate HTTP cases with identical responses, including 83 rejections. First-party unsafe Rust remains forbidden. See the [profiling and validation summary](https://github.com/meiroio/filtr/blob/main/bench/results/2026-10-25-profile-arm64.json).
 
-The proxy still adds an HTTP hop and inspection. These closed-loop tests with a trivial origin are a development reference, not a production capacity or latency-SLA guarantee. TLS, real application work, large generated policies and AI review cost are outside this test. The optimized numbers describe a **source build**, rather than the released 0.1.0 image.
+The proxy still adds an HTTP hop and inspection. These closed-loop tests with a trivial origin are a development reference, not a production capacity or latency-SLA guarantee. TLS, real application work, large generated policies and AI review cost are outside this test. The optimized numbers were measured from a pre-release **source build** of the changes now shipped in **v0.1.1**; they are not a new measurement of the release artifacts.
 
 Reproduce using Docker Compose and Python 3:
 
 ```sh
 git clone --depth 1 https://github.com/meiroio/filtr.git filtr-benchmark
 cd filtr-benchmark
-docker build --target runtime -t filtr-benchmark:optimized .
-python3 bench/run.py --image filtr-benchmark:optimized \
+python3 bench/run.py --image ghcr.io/meiroio/filtr:0.1.1 \
   --baseline-image ghcr.io/meiroio/filtr:0.1.0@sha256:5333b0a0101a08ee902c90e68bc36fa44eba1ec9948be050f65648837a52bc03 \
   --duration 15 --repeats 3 --connections 64 \
   --host-description 'Describe your CPU and RAM' --output data/benchmark
 ```
 
-The harness builds the demo/load-generator images, uses an isolated Docker network and makes no AI calls. Omitting `--image` retains the pinned released image; omitting `--baseline-image` runs a single variant. See the [methodology](https://github.com/meiroio/filtr/blob/main/bench/README.md). Local raw reports and profiles stay under ignored `data/`.
+The harness builds the demo/load-generator images, uses an isolated Docker network and makes no AI calls. Omitting `--image` selects the current release; omitting `--baseline-image` runs a single variant. See the [methodology](https://github.com/meiroio/filtr/blob/main/bench/README.md). Local raw reports and profiles stay under ignored `data/`.
 
 ## Agent instructions: operate Filtr through its APIs
 

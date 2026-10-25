@@ -15,6 +15,7 @@ import time
 
 ROOT = Path(__file__).resolve().parent.parent
 BASELINE_IMAGE = "ghcr.io/meiroio/filtr:0.1.0@sha256:5333b0a0101a08ee902c90e68bc36fa44eba1ec9948be050f65648837a52bc03"
+DEFAULT_IMAGE = "ghcr.io/meiroio/filtr:0.1.1"
 
 
 def command(args, *, prefix=(), **kwargs):
@@ -158,7 +159,7 @@ def main():
     parser.add_argument("--connections", type=int, default=64)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--host-description", default="unspecified")
-    parser.add_argument("--image", default=BASELINE_IMAGE, help="Filtr image to measure")
+    parser.add_argument("--image", default=DEFAULT_IMAGE, help="Filtr image to measure")
     parser.add_argument("--baseline-image", help="Also measure this Filtr image, alternating each workload pair")
     parser.add_argument("--output", type=Path, default=ROOT / "data/benchmark")
     args = parser.parse_args()
