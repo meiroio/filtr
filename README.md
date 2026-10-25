@@ -1,5 +1,7 @@
 # Filtr
 
+[Simple mode](#simple-mode) · [Kubernetes](#kubernetes-mode) · [Filtering](#how-filtering-works) · [API](#api-reference) · [Configuration](#configuration) · [Performance](#performance) · [Agent instructions](#agent-instructions-operate-filtr-through-its-apis) · [Docs](#documentation) · [License](#limits-and-license)
+
 ![Filtr](filtr.png)
 
 An API-only Rust HTTP reverse proxy that uses an SBOM and AI research to propose targeted request filters. Findings without a supported filter are reported for maintenance; they do not block the whole application by default. A separate authenticated kill switch and optional critical-risk escalation control full blocking.
@@ -104,25 +106,26 @@ Deploy the same proxy in front of a private application Service. This mode uses 
 Existing HTTPS ingress → Filtr Service :8080 → private application Service
 ```
 
-Get the release source and build an image for a registry your cluster can pull from. Replace `YOUR_ORG` with your registry namespace:
+Use the public image **`ghcr.io/meiroio/filtr:0.1.0`**, which supports **linux/amd64 and linux/arm64**. Kubernetes selects the node's architecture automatically; no registry login or local image build is needed. Download the release's deployment manifest:
 
 ```sh
 set -eu
-git clone --branch v0.1.0 --depth 1 https://github.com/meiroio/filtr.git filtr-source
-cd filtr-source
-export FILTR_IMAGE=ghcr.io/YOUR_ORG/filtr:0.1.0
-docker buildx build --platform linux/amd64,linux/arm64 -t "$FILTR_IMAGE" --push .
+mkdir filtr-kubernetes-v0.1.0
+cd filtr-kubernetes-v0.1.0
+curl --fail --location \
+  https://github.com/meiroio/filtr/releases/download/v0.1.0/filtr-v0.1.0-kubernetes.yaml \
+  --output filtr.yaml
 ```
 
-The GitHub release supplies installer archives, not a prebuilt container image. In [deploy/kubernetes/filtr.yaml](https://github.com/meiroio/filtr/blob/v0.1.0/deploy/kubernetes/filtr.yaml), set the image you pushed and `FILTR_UPSTREAM` to the real application's HTTP(S) Service origin. Choose the namespace and storage class for your cluster. Then:
+The downloaded `filtr.yaml` already selects the published image. Set `FILTR_UPSTREAM` to the real application's HTTP(S) Service origin, and choose the namespace and storage class for your cluster. The maintained source is [deploy/kubernetes/filtr.yaml](https://github.com/meiroio/filtr/blob/main/deploy/kubernetes/filtr.yaml). Then:
 
 1. Create `filtr-admin` from a protected 128-character hexadecimal admin secret. Optionally create `filtr-ai` from your provider/model settings.
-2. Apply the edited manifest: `kubectl apply -f deploy/kubernetes/filtr.yaml`.
+2. Apply the edited manifest: `kubectl apply -f filtr.yaml`.
 3. Open the private admin connection: `kubectl port-forward --address 127.0.0.1 deployment/filtr 9090:9090`.
 4. Upload the actual application/environment SBOM through `POST /v1/sbom` and inspect its AI status, gaps and remediation report.
 5. Point the existing ingress backend at Service `filtr:8080`, remove alternate public routes to the origin and apply suitable NetworkPolicies.
 
-The [complete Kubernetes commands](docs/kubernetes.md) cover secrets, storage, upload, ingress and probes. The bundled manifest uses **one replica**, Recreate updates and persistent `/data`; it has no multi-replica policy-distribution controller. Readiness means a policy is installed, not that the origin is healthy or vulnerability-free.
+The [complete Kubernetes commands](docs/kubernetes.md) cover secrets, storage, upload, ingress and probes. Use the versioned image for deployments; `latest` follows published stable releases. For immutable deployments, pin the multi-architecture manifest digest. The bundled manifest uses **one replica**, Recreate updates and persistent `/data`; it has no multi-replica policy-distribution controller. Readiness means a policy is installed, not that the origin is healthy or vulnerability-free.
 
 For original client IP/HTTPS forwarding, configure the actual ingress socket-peer IPs in `FILTR_TRUSTED_PROXIES` and make that ingress overwrite client-supplied forwarding headers. Only exact IPs are supported; changing pod IPs require configuration maintenance. Keep administration off public Services and ingress routes.
 
@@ -169,6 +172,32 @@ Native runs load `.env` from their current working directory. Existing environme
 | `FILTR_TRUSTED_PROXIES`, `FILTR_ALLOWED_HOSTS` | Exact trusted peer IPs and optional allowed public hostnames. |
 
 Without a model override, valid SBOM uploads refresh leaderboard selection. Previews, timed/manual research refreshes and restarts reuse saved selection. Pinned models skip the leaderboard. Cache hits keep their original expiry; previews and read-only reports do not suspend the independent expiry timer. Details and deadlines are in the [AI guide](docs/ai.md) and [.env.example](.env.example).
+
+## Performance
+
+Local Docker benchmark of the published **Filtr 0.1.0, native arm64**, measured on 2026-10-25: Apple M4 with 32 GiB RAM; Docker Engine 29.8.2 in a 10-vCPU, 15.6-GiB Docker Desktop VM. Filtr had a **2-CPU quota and 512 MiB limit**. The demo origin and oha 1.16.0 load generator ran in separate containers, each with a 2-CPU quota. Baseline guards and one curated Log4j rule were active; AI analysis was disabled.
+
+HTTP/1.1, no TLS, 64 keep-alive connections, three 15-second runs per workload after a three-second warm-up. Throughput and latency columns are medians of the individual runs; p99 is the median of three per-run p99 values.
+
+| Workload | Direct origin, req/s | Through Filtr, req/s | Filtr p50 | Filtr p99 |
+| --- | ---: | ---: | ---: | ---: |
+| GET, small JSON response | 308,899 | 54,884 | 1.12 ms | 2.33 ms |
+| POST, 1 KiB JSON body | 324,308 | 54,227 | 1.12 ms | 2.41 ms |
+| POST, 64 KiB JSON body | 135,971 | 31,360 | 1.90 ms | 5.48 ms |
+| Lookup header, blocked with 403 | — | 254,429 | 0.24 ms | 0.62 ms |
+
+All measured benign requests returned 200; the blocking case returned 403. There were no connection or upstream errors. Blocking responses do not reach the origin. Filtr GET throughput ranged from 50,328 to 67,696 req/s across runs, reflecting variation on this shared development host. The direct comparison includes the cost of the extra HTTP proxy hop and inspection. These closed-loop measurements with a trivial origin are a development reference, not a production capacity or latency-SLA guarantee; TLS, real application work, large generated policies and AI review cost are outside this test.
+
+Reproduce from the [benchmark source](https://github.com/meiroio/filtr/tree/main/bench), using Docker Compose and Python 3:
+
+```sh
+git clone --depth 1 https://github.com/meiroio/filtr.git filtr-benchmark
+cd filtr-benchmark
+python3 bench/run.py --duration 15 --repeats 3 --connections 64 \
+  --host-description 'Describe your CPU and RAM' --output data/benchmark
+```
+
+The harness pulls Filtr by digest, builds the demo/load-generator images, uses an isolated Docker network and makes no AI calls. See the [methodology](https://github.com/meiroio/filtr/blob/main/bench/README.md) and [per-run results](https://github.com/meiroio/filtr/blob/main/bench/results/2026-10-25-arm64.json). Local raw reports stay under ignored `data/`.
 
 ## Agent instructions: operate Filtr through its APIs
 

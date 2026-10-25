@@ -1,0 +1,319 @@
+{
+  "results": {
+    "direct_get": {
+      "requests_per_second": 308898.9425012704,
+      "p50_ms": 0.19145800000000002,
+      "p99_ms": 0.505166,
+      "rps_min": 307041.6393562072,
+      "rps_max": 393727.93277490995,
+      "responses": 15151376
+    },
+    "filtr_get": {
+      "requests_per_second": 54883.844144977105,
+      "p50_ms": 1.121375,
+      "p99_ms": 2.333583,
+      "rps_min": 50328.38634516628,
+      "rps_max": 67695.54933049824,
+      "responses": 2594212
+    },
+    "direct_post_1k": {
+      "requests_per_second": 324308.41463873605,
+      "p50_ms": 0.180709,
+      "p99_ms": 0.49629100000000004,
+      "rps_min": 284847.57872909657,
+      "rps_max": 353381.84537306434,
+      "responses": 14441982
+    },
+    "filtr_post_1k": {
+      "requests_per_second": 54226.65971912769,
+      "p50_ms": 1.121167,
+      "p99_ms": 2.4115830000000003,
+      "rps_min": 46246.09099051984,
+      "rps_max": 57623.6335336808,
+      "responses": 2371908
+    },
+    "direct_post_64k": {
+      "requests_per_second": 135970.9553563313,
+      "p50_ms": 0.43675,
+      "p99_ms": 1.136458,
+      "rps_min": 110929.72943141159,
+      "rps_max": 137398.95500066906,
+      "responses": 5765205
+    },
+    "filtr_post_64k": {
+      "requests_per_second": 31359.963446160127,
+      "p50_ms": 1.894959,
+      "p99_ms": 5.482625,
+      "rps_min": 25713.696063187766,
+      "rps_max": 33547.699835832515,
+      "responses": 1359657
+    },
+    "filtr_block": {
+      "requests_per_second": 254428.8524179261,
+      "p50_ms": 0.235625,
+      "p99_ms": 0.6152500000000001,
+      "rps_min": 214815.30656834602,
+      "rps_max": 259288.37532301035,
+      "responses": 10929484
+    }
+  },
+  "counters_before": {
+    "blocked": 0,
+    "proxied": 1,
+    "seen": 1,
+    "upstream_errors": 0
+  },
+  "counters_after": {
+    "blocked": 11785359,
+    "proxied": 6838673,
+    "seen": 18624032,
+    "upstream_errors": 0
+  },
+  "ai_status": "not_configured",
+  "active_rules": [
+    {
+      "action": {
+        "patterns": [
+          "${"
+        ],
+        "type": "tokens"
+      },
+      "affected": [
+        ">=2.0.0, <2.3.1",
+        ">=2.4.0, <2.12.2",
+        ">=2.13.0, <2.15.0"
+      ],
+      "cve": "CVE-2021-44228",
+      "description": "Reject all lookup expressions in request targets, headers and bodies. This deliberately blocks legitimate interpolation too; application-specific decoding may still evade token inspection.",
+      "id": "log4shell-lookups",
+      "packages": [
+        "pkg:maven/org.apache.logging.log4j/log4j-core"
+      ],
+      "source": "https://logging.apache.org/security.html#CVE-2021-44228"
+    }
+  ],
+  "setup": {
+    "recorded_at": "2026-10-25T10:43:43.326334+00:00",
+    "duration_seconds": 15,
+    "repeats": 3,
+    "connections": 64,
+    "warmup_seconds": 3,
+    "host": "Apple M4, 32 GiB RAM; shared development host",
+    "cpu_limit_per_container": 2,
+    "docker": {
+      "version": "29.8.2",
+      "architecture": "aarch64",
+      "cpus": 10,
+      "memory_bytes": 16745820160
+    },
+    "source_revision": "3bc9725d5d884802765309a46cff81319ee1202f",
+    "image": "ghcr.io/meiroio/filtr:0.1.0@sha256:5333b0a0101a08ee902c90e68bc36fa44eba1ec9948be050f65648837a52bc03",
+    "load_generator": "oha 1.16.0",
+    "source_dirty": true
+  },
+  "measured_runs": {
+    "direct_get": [
+      {
+        "requests_per_second": 393727.93277490995,
+        "p50_ms": 0.14875000000000002,
+        "p99_ms": 0.439666,
+        "response_counts": {
+          "200": 5907805
+        },
+        "errors": {}
+      },
+      {
+        "requests_per_second": 307041.6393562072,
+        "p50_ms": 0.19145800000000002,
+        "p99_ms": 0.518791,
+        "response_counts": {
+          "200": 4607241
+        },
+        "errors": {}
+      },
+      {
+        "requests_per_second": 308898.9425012704,
+        "p50_ms": 0.192958,
+        "p99_ms": 0.505166,
+        "response_counts": {
+          "200": 4636330
+        },
+        "errors": {}
+      }
+    ],
+    "filtr_get": [
+      {
+        "requests_per_second": 67695.54933049824,
+        "p50_ms": 0.902167,
+        "p99_ms": 1.977042,
+        "response_counts": {
+          "200": 1015617
+        },
+        "errors": {}
+      },
+      {
+        "requests_per_second": 54883.844144977105,
+        "p50_ms": 1.121375,
+        "p99_ms": 2.333583,
+        "response_counts": {
+          "200": 823559
+        },
+        "errors": {}
+      },
+      {
+        "requests_per_second": 50328.38634516628,
+        "p50_ms": 1.225709,
+        "p99_ms": 2.457625,
+        "response_counts": {
+          "200": 755036
+        },
+        "errors": {}
+      }
+    ],
+    "direct_post_1k": [
+      {
+        "requests_per_second": 353381.84537306434,
+        "p50_ms": 0.16487500000000002,
+        "p99_ms": 0.49629100000000004,
+        "response_counts": {
+          "200": 5301713
+        },
+        "errors": {}
+      },
+      {
+        "requests_per_second": 324308.41463873605,
+        "p50_ms": 0.180709,
+        "p99_ms": 0.481834,
+        "response_counts": {
+          "200": 4866114
+        },
+        "errors": {}
+      },
+      {
+        "requests_per_second": 284847.57872909657,
+        "p50_ms": 0.208417,
+        "p99_ms": 0.5295,
+        "response_counts": {
+          "200": 4274155
+        },
+        "errors": {}
+      }
+    ],
+    "filtr_post_1k": [
+      {
+        "requests_per_second": 57623.6335336808,
+        "p50_ms": 1.049583,
+        "p99_ms": 2.309292,
+        "response_counts": {
+          "200": 864553
+        },
+        "errors": {}
+      },
+      {
+        "requests_per_second": 54226.65971912769,
+        "p50_ms": 1.121167,
+        "p99_ms": 2.4115830000000003,
+        "response_counts": {
+          "200": 813516
+        },
+        "errors": {}
+      },
+      {
+        "requests_per_second": 46246.09099051984,
+        "p50_ms": 1.336708,
+        "p99_ms": 2.6272919999999997,
+        "response_counts": {
+          "200": 693839
+        },
+        "errors": {}
+      }
+    ],
+    "direct_post_64k": [
+      {
+        "requests_per_second": 137398.95500066906,
+        "p50_ms": 0.430791,
+        "p99_ms": 1.136458,
+        "response_counts": {
+          "200": 2061254
+        },
+        "errors": {}
+      },
+      {
+        "requests_per_second": 135970.9553563313,
+        "p50_ms": 0.43675,
+        "p99_ms": 1.127167,
+        "response_counts": {
+          "200": 2039862
+        },
+        "errors": {}
+      },
+      {
+        "requests_per_second": 110929.72943141159,
+        "p50_ms": 0.541666,
+        "p99_ms": 1.400042,
+        "response_counts": {
+          "200": 1664089
+        },
+        "errors": {}
+      }
+    ],
+    "filtr_post_64k": [
+      {
+        "requests_per_second": 33547.699835832515,
+        "p50_ms": 1.812666,
+        "p99_ms": 4.503875,
+        "response_counts": {
+          "200": 503333
+        },
+        "errors": {}
+      },
+      {
+        "requests_per_second": 31359.963446160127,
+        "p50_ms": 1.894959,
+        "p99_ms": 5.482625,
+        "response_counts": {
+          "200": 470493
+        },
+        "errors": {}
+      },
+      {
+        "requests_per_second": 25713.696063187766,
+        "p50_ms": 2.367625,
+        "p99_ms": 5.69475,
+        "response_counts": {
+          "200": 385831
+        },
+        "errors": {}
+      }
+    ],
+    "filtr_block": [
+      {
+        "requests_per_second": 254428.8524179261,
+        "p50_ms": 0.235625,
+        "p99_ms": 0.6152500000000001,
+        "response_counts": {
+          "403": 3816804
+        },
+        "errors": {}
+      },
+      {
+        "requests_per_second": 259288.37532301035,
+        "p50_ms": 0.234917,
+        "p99_ms": 0.577083,
+        "response_counts": {
+          "403": 3889955
+        },
+        "errors": {}
+      },
+      {
+        "requests_per_second": 214815.30656834602,
+        "p50_ms": 0.287917,
+        "p99_ms": 0.641541,
+        "response_counts": {
+          "403": 3222725
+        },
+        "errors": {}
+      }
+    ]
+  }
+}

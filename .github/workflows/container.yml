@@ -64,12 +64,13 @@ jobs:
           image="$IMAGE:$VERSION-$ARCH"
           test "$(docker run --rm "$image" --version)" = "filtr $VERSION"
           test "$(docker image inspect "$image" --format '{{.Config.User}}')" = '10001:10001'
-          export FILTR_ADMIN_TOKEN="$(openssl rand -hex 64)"
+          FILTR_ADMIN_TOKEN=$(openssl rand -hex 64)
+          export FILTR_ADMIN_TOKEN
           docker run --detach --name filtr-container-check --read-only --cap-drop ALL \
             --security-opt no-new-privileges --tmpfs /data:uid=10001,gid=10001,mode=0700 \
             --env FILTR_ADMIN_TOKEN "$image" --upstream http://127.0.0.1:3000
           trap 'docker rm --force filtr-container-check >/dev/null' EXIT
-          for attempt in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             if docker exec filtr-container-check filtr-probe live; then break; fi
             sleep 1
           done

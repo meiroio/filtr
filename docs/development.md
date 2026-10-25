@@ -5,7 +5,7 @@
 Commands in this guide run from a source checkout, not the extracted binary archive.
 
 ```sh
-git clone --branch v0.1.0 --depth 1 https://github.com/meiroio/filtr.git filtr-source
+git clone --depth 1 https://github.com/meiroio/filtr.git filtr-source
 cd filtr-source
 ```
 
@@ -58,6 +58,8 @@ Uploads are validated and compiled before activation, atomically saved to `data/
 Static mappings activate immediately after persistence and serve traffic throughout AI review and backup attempts. The upload response waits for configured AI review to finish or reach its deadline. While waiting, `/v1/status` shows the current pending phase. Generated restrictions activate atomically only after a successful AI review. Missing credentials or failure of both the primary and available backup leave the static policy in place, with vulnerability coverage explicitly unknown. Each upload replaces the previous policy, including previous AI enhancements. Processing continues if the client disconnects. Concurrent uploads return 409 until the current upload and review finish.
 
 ## Docker
+
+The public `ghcr.io/meiroio/filtr:0.1.0` image already supports amd64 and arm64. Use the [Kubernetes deployment guide](kubernetes.md) to deploy it without a build. The following commands are for optional local development or publishing a customized image.
 
 The [Dockerfile](https://github.com/meiroio/filtr/blob/v0.1.0/Dockerfile) uses a Rust build stage and a Debian runtime with CA certificates and curl for authenticated loopback probes. The runtime runs as UID/GID `10001`, handles SIGTERM, and exposes only public port 8080. The build context is restricted by [.dockerignore](https://github.com/meiroio/filtr/blob/v0.1.0/.dockerignore); local SBOMs, tokens and data are not copied into the image. Build for the CPU architecture used by your cluster:
 
@@ -150,6 +152,8 @@ Remove the application's direct public port mapping and old proxy routes after s
 Publishing Docker port 9090 would not make the loopback-only admin listener accessible. Use `docker exec` as above. `/data` must be writable by UID/GID 10001 and persisted to retain both the SBOM and its leaderboard snapshot. Docker's health check reports admin responsiveness even before an SBOM is installed; public requests still return 503 until installation.
 
 ## Validation and performance
+
+For end-to-end Docker measurements, use the [HTTP benchmark harness](https://github.com/meiroio/filtr/tree/main/bench) and see the [measured results](../README.md#performance). The inspection microbenchmark below measures only the matching engine.
 
 ```sh
 cargo fmt --check

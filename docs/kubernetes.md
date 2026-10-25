@@ -2,16 +2,20 @@
 
 [Back to deployment choices](../README.md)
 
-Build and push a container image to a registry your cluster can pull from; this release publishes installer archives, not a prebuilt container image. From the release source checkout:
+The public image **`ghcr.io/meiroio/filtr:0.1.0`** supports **linux/amd64 and linux/arm64** under one multi-architecture tag. Nodes pull the appropriate image without registry credentials. Download the deployment manifest without cloning or building the project:
 
 ```sh
-export FILTR_IMAGE=ghcr.io/YOUR_ORG/filtr:0.1.0
-docker buildx build --platform linux/amd64,linux/arm64 -t "$FILTR_IMAGE" --push .
+set -eu
+mkdir filtr-kubernetes-v0.1.0
+cd filtr-kubernetes-v0.1.0
+curl --fail --location \
+  https://github.com/meiroio/filtr/releases/download/v0.1.0/filtr-v0.1.0-kubernetes.yaml \
+  --output filtr.yaml
 ```
 
-Replace `YOUR_ORG` with your registry namespace. Configure image-pull credentials if the registry is private.
+The manifest already uses the versioned image. `ghcr.io/meiroio/filtr:latest` tracks published stable releases; prefer a version or manifest digest for controlled deployments. To resolve a digest on a machine with Docker, run `docker buildx imagetools inspect ghcr.io/meiroio/filtr:0.1.0`, then set `image: ghcr.io/meiroio/filtr:0.1.0@sha256:THE_INDEX_DIGEST`. Use the top-level multi-architecture digest for a mixed cluster. Source builds remain an optional [development workflow](development.md#docker).
 
-[deploy/kubernetes/filtr.yaml](https://github.com/meiroio/filtr/blob/v0.1.0/deploy/kubernetes/filtr.yaml) supplies a Deployment, ClusterIP Service and 1 GiB persistent volume claim. It does not create a public load balancer, ingress, certificate or network isolation rules. Edit its image reference and the Deployment's `env` entry for `FILTR_UPSTREAM` to match your registry and application Service. For example, `http://application.default.svc.cluster.local:3000` means Service `application`, namespace `default`, Service port `3000`. Use your cluster's storage class if it has no default. The examples below use the default namespace. The runtime uses a read-only root filesystem, drops capabilities, runs without root or a service-account token, and writes only to `/data`.
+`filtr.yaml` supplies a Deployment, ClusterIP Service and 1 GiB persistent volume claim; its maintained source is [deploy/kubernetes/filtr.yaml](https://github.com/meiroio/filtr/blob/main/deploy/kubernetes/filtr.yaml). It does not create a public load balancer, ingress, certificate or network isolation rules. Edit the Deployment's `env` entry for `FILTR_UPSTREAM` to match your application Service. For example, `http://application.default.svc.cluster.local:3000` means Service `application`, namespace `default`, Service port `3000`. Use your cluster's storage class if it has no default. The examples below use the default namespace. The runtime uses a read-only root filesystem, drops capabilities, runs without root or a service-account token, and writes only to `/data`.
 
 ### Connect the existing ingress
 
@@ -67,7 +71,7 @@ FILTR_AI_PROVIDER=anthropic
 
 ```sh
 kubectl create secret generic filtr-ai --from-env-file=.secrets/ai.env
-kubectl apply -f deploy/kubernetes/filtr.yaml
+kubectl apply -f filtr.yaml
 kubectl get pods -l app.kubernetes.io/name=filtr
 ```
 

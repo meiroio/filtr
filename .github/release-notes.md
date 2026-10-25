@@ -17,7 +17,7 @@ The archives include the standalone Linux executable, installer, reference guide
 - OpenAI/Anthropic vulnerability research, model override, persistent component cache, and automatic expiry refresh.
 - Cache-only SBOM previews, remediation reports, maintenance webhooks, and persistent traffic controls.
 - Optional source-backed AI critical-risk escalation; full blocking is disabled by default.
-- Kubernetes manifests and Docker build instructions for an operator-supplied image and deployed-environment SBOM.
+- Public GHCR runtime image for linux/amd64 and linux/arm64, plus a Kubernetes manifest and deployed-environment SBOM instructions.
 
 ### Scope
 
