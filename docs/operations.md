@@ -69,7 +69,7 @@ With a complete `.env`, run the native server with `cargo run --locked --bin fil
 
 Public requests never reach Filtr's admin API. `/v1/status` on the public port is an ordinary upstream path. Keep the origin inaccessible to external clients, otherwise attackers can bypass Filtr.
 
-**Request compression is available in source builds after v0.1.1.** Published v0.1.1 binaries/images still reject compressed request bodies with 415. Admin JSON endpoints continue to require uncompressed bodies.
+**v0.1.2 supports bounded request decompression.** Admin JSON endpoints continue to require uncompressed bodies.
 
 `FILTR_MAX_BODY_BYTES` limits both compressed input and total decoded output independently; either exceeding it returns 413. Brotli working allocations have a separate budget of four times that limit, clamped to 1–32 MiB; exhaustion also returns 413. The nonstandard Brotli large-window extension is disabled. These limits can reject otherwise valid large uploads. Size container memory for buffered wire bodies, decoded bodies and decoder workspace.
 
@@ -82,7 +82,7 @@ At most four decoders run per instance, further limited by `FILTR_MAX_IN_FLIGHT`
 | [CVE-2021-44228](https://logging.apache.org/security.html#CVE-2021-44228) | Maven `org.apache.logging.log4j/log4j-core` | Block every `${` lookup expression, including ordinary interpolation. Scan request target, header names/values and complete body. |
 | [CVE-2025-55182](https://react.dev/blog/2025/12/03/critical-security-vulnerability-in-react-server-components) | npm `react-server-dom-webpack`, `react-server-dom-parcel`, `react-server-dom-turbopack` | The existing broad method restriction is advisory-only; report the CVE for SRE action without disabling every write. |
 
-Version ranges and source URLs live in [`rules/default.json`](https://github.com/meiroio/filtr/blob/v0.1.1/rules/default.json). The bundled catalogue contains curated examples; AI supplies automatic vulnerability discovery for the uploaded inventory. The RSC catalogue entry is a broad advisory-only method restriction; the Log4j entry is an enforced payload heuristic. Neither is a vendor-certified mitigation or a complete protocol validator.
+Version ranges and source URLs live in [`rules/default.json`](https://github.com/meiroio/filtr/blob/v0.1.2/rules/default.json). The bundled catalogue contains curated examples; AI supplies automatic vulnerability discovery for the uploaded inventory. The RSC catalogue entry is a broad advisory-only method restriction; the Log4j entry is an enforced payload heuristic. Neither is a vendor-certified mitigation or a complete protocol validator.
 
 Add newly researched rules by copying the catalogue and starting with `--rules /path/to/catalogue.json`. This **replaces** the bundled catalogue; retain existing entries you need. Catalogue changes require a restart; SBOM changes do not. The catalogue is operator-controlled and is never fetched from the internet in the request path.
 

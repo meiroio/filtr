@@ -35,7 +35,8 @@ ENTRY = Path("/usr/local/sbin/filtr-simple")
 ENABLE = Path("/etc/systemd/system/multi-user.target.wants/filtr-simple.service")
 MODULES = ("proxy", "proxy_http", "headers", "setenvif", "remoteip")
 ENV_KEYS = {"OPENAI_API_KEY", "ANTHROPIC_API_KEY", "FILTR_AI_PROVIDER", "FILTR_AI_MODEL",
-            "FILTR_AI_REASONING", "FILTR_AI_CACHE_TTL_SECS", "FILTR_AI_TIMEOUT_SECS",
+            "FILTR_AI_REASONING", "FILTR_AI_CACHE_TTL_SECS", "FILTR_AI_CACHE_ONLY",
+            "FILTR_AI_HTTP_RETRIES", "FILTR_AI_TIMEOUT_SECS",
             "FILTR_AI_REVIEW_TIMEOUT_SECS", "FILTR_WEBHOOK_URL", "FILTR_WEBHOOK_TOKEN",
             "FILTR_WEBHOOK_TIMEOUT_SECS", "FILTR_AUTO_BLOCK_CRITICAL", "FILTR_MAX_BODY_BYTES",
             "FILTR_MAX_IN_FLIGHT", "FILTR_TIMEOUT_SECS"}

@@ -11,7 +11,7 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
   filtr:
-    image: ${FILTR_BENCH_IMAGE:-ghcr.io/meiroio/filtr:0.1.1}
+    image: ${FILTR_BENCH_IMAGE:-ghcr.io/meiroio/filtr:0.1.2}
     cpus: 2.0
     mem_limit: 512m
     environment:

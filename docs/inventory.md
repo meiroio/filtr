@@ -6,7 +6,7 @@
 
 Prefer [CycloneDX JSON](https://cyclonedx.org/capabilities/sbom/), with a Package URL (`purl`) for each component. Filtr extracts components from CycloneDX 1.4–1.7, including nested components and `metadata.component`. It also extracts SPDX 2.2/2.3 JSON packages and their `purl` external references. This is an inventory parser, not full SBOM schema validation. SPDX 3 is not supported.
 
-Examples: [`examples/sbom.cdx.json`](https://github.com/meiroio/filtr/blob/v0.1.1/examples/sbom.cdx.json), [`examples/sbom.spdx.json`](https://github.com/meiroio/filtr/blob/v0.1.1/examples/sbom.spdx.json), [`examples/sbom.simple.json`](https://github.com/meiroio/filtr/blob/v0.1.1/examples/sbom.simple.json).
+Examples: [`examples/sbom.cdx.json`](https://github.com/meiroio/filtr/blob/v0.1.2/examples/sbom.cdx.json), [`examples/sbom.spdx.json`](https://github.com/meiroio/filtr/blob/v0.1.2/examples/sbom.spdx.json), [`examples/sbom.simple.json`](https://github.com/meiroio/filtr/blob/v0.1.2/examples/sbom.simple.json).
 
 For a hand-written inventory, use this small Filtr-specific format:
 

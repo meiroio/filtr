@@ -17,20 +17,20 @@ For **Debian 12+ and Ubuntu 22.04+** hosts with Python 3, systemd, curl, CA cert
 
 ### Download
 
-Release **[v0.1.1](https://github.com/meiroio/filtr/releases/tag/v0.1.1)**:
+Release **[v0.1.2](https://github.com/meiroio/filtr/releases/tag/v0.1.2)**:
 
 | Linux architecture | Package | Checksum |
 | --- | --- | --- |
-| amd64 / x86_64 | [Download](https://github.com/meiroio/filtr/releases/download/v0.1.1/filtr-v0.1.1-linux-amd64.tar.gz) | [SHA-256](https://github.com/meiroio/filtr/releases/download/v0.1.1/filtr-v0.1.1-linux-amd64.tar.gz.sha256) |
-| arm64 / aarch64 | [Download](https://github.com/meiroio/filtr/releases/download/v0.1.1/filtr-v0.1.1-linux-arm64.tar.gz) | [SHA-256](https://github.com/meiroio/filtr/releases/download/v0.1.1/filtr-v0.1.1-linux-arm64.tar.gz.sha256) |
+| amd64 / x86_64 | [Download](https://github.com/meiroio/filtr/releases/download/v0.1.2/filtr-v0.1.2-linux-amd64.tar.gz) | [SHA-256](https://github.com/meiroio/filtr/releases/download/v0.1.2/filtr-v0.1.2-linux-amd64.tar.gz.sha256) |
+| arm64 / aarch64 | [Download](https://github.com/meiroio/filtr/releases/download/v0.1.2/filtr-v0.1.2-linux-arm64.tar.gz) | [SHA-256](https://github.com/meiroio/filtr/releases/download/v0.1.2/filtr-v0.1.2-linux-arm64.tar.gz.sha256) |
 
 Run on the target Debian/Ubuntu host, in a new directory:
 
 ```sh
 set -eu
-mkdir filtr-v0.1.1
-cd filtr-v0.1.1
-FILTR_VERSION=v0.1.1
+mkdir filtr-v0.1.2
+cd filtr-v0.1.2
+FILTR_VERSION=v0.1.2
 FILTR_ARCH=$(dpkg --print-architecture)
 case "$FILTR_ARCH" in amd64|arm64) ;; *) echo 'Supported architectures: amd64, arm64' >&2; exit 1;; esac
 FILTR_ARCHIVE="filtr-${FILTR_VERSION}-linux-${FILTR_ARCH}.tar.gz"
@@ -106,14 +106,14 @@ Deploy the same proxy in front of a private application Service. This mode uses 
 Existing HTTPS ingress → Filtr Service :8080 → private application Service
 ```
 
-Use the public image **`ghcr.io/meiroio/filtr:0.1.1`**, which supports **linux/amd64 and linux/arm64**. Kubernetes selects the node's architecture automatically; no registry login or local image build is needed. Download the release's deployment manifest:
+Use the public image **`ghcr.io/meiroio/filtr:0.1.2`**, which supports **linux/amd64 and linux/arm64**. Kubernetes selects the node's architecture automatically; no registry login or local image build is needed. Download the release's deployment manifest:
 
 ```sh
 set -eu
-mkdir filtr-kubernetes-v0.1.1
-cd filtr-kubernetes-v0.1.1
+mkdir filtr-kubernetes-v0.1.2
+cd filtr-kubernetes-v0.1.2
 curl --fail --location \
-  https://github.com/meiroio/filtr/releases/download/v0.1.1/filtr-v0.1.1-kubernetes.yaml \
+  https://github.com/meiroio/filtr/releases/download/v0.1.2/filtr-v0.1.2-kubernetes.yaml \
   --output filtr.yaml
 ```
 
@@ -133,11 +133,11 @@ For original client IP/HTTPS forwarding, configure the actual ingress socket-pee
 
 Filtr accepts HTTP/1.0 and HTTP/1.1 over TCP and forwards HTTP/1.1 to a fixed HTTP(S) upstream. An existing ingress or web server handles public TLS. Uploading an SBOM activates matching curated filters and runs configured AI analysis, reusing valid component reviews. OpenAI or Anthropic hosted search supplies automatic vulnerability discovery; there is no advisory-database lookup engine.
 
-Source builds after v0.1.1 instruct both providers to include [cve.now](https://cve.now/) in discovery, then cross-check affected versions and request mitigations against primary advisories. This uses the existing search budget and takes effect on new or expired reviews; valid cached reviews retain their original expiry. See [research sources](docs/ai.md#research-sources) for evidence, privacy and fallback behavior.
+Filtr v0.1.2 instructs both providers to include [cve.now](https://cve.now/) in discovery, then cross-check affected versions and request mitigations against primary advisories. This uses the existing search budget and takes effect on new or expired reviews; valid cached reviews retain their original expiry. See [research sources](docs/ai.md#research-sources) for evidence, privacy and fallback behavior.
 
 Validated AI restrictions target request methods, paths, headers or body markers. Findings without supported narrow protection appear in `uncovered_vulnerabilities` and optional SRE webhook notifications. They do not quarantine every vulnerable dependency. Broad AI read-only/deny-all enhancements are rejected. Curated token heuristics remain implemented; legacy broad catalogue entries are advisory-only.
 
-Source builds after v0.1.1 inspect incoming Brotli, gzip and zlib-wrapped deflate bodies under explicit size and decoder limits, then forward the original bytes. An applicable vulnerability rule can block a particular encoding before decompression; removing that restriction after a verified patch restores valid requests. The published v0.1.1 packages still reject compressed request bodies. See [HTTP behavior](docs/operations.md#http-behavior) for bounds and supported formats.
+Filtr v0.1.2 inspects incoming Brotli, gzip and zlib-wrapped deflate bodies under explicit size and decoder limits, then forwards the original bytes. An applicable vulnerability rule can block a particular encoding before decompression; removing that restriction after a verified patch restores valid requests. See [HTTP behavior](docs/operations.md#http-behavior) for bounds and supported formats.
 
 Default traffic mode is `auto` with `FILTR_AUTO_BLOCK_CRITICAL=false`. `POST /v1/traffic` can select `block_all` to stop new requests, `filter` to resume targeted protection, or `auto` to resume configured automation. Opt-in critical escalation requires an AI assessment of active exploitation, unauthenticated remote critical impact on the HTTP/1 upstream and no narrow mitigation. Operator blocking persists across uploads and restarts. Missing, failed or partial AI does not clear an established emergency decision.
 
@@ -153,10 +153,11 @@ All admin endpoints require `Authorization: Bearer <FILTR_ADMIN_TOKEN>` on the p
 | `GET /v1/status`, `GET /v1/rules` | Installed policy, findings, coverage, readable inventory gaps, AI/cache status and counters. |
 | `GET /v1/remediation` | Current targeted blockers, uncovered CVEs, affected components/images and cached fix suggestions; no AI calls. |
 | `POST /v1/sbom` | Replace the installed SBOM, analyze it and return policy plus readable gaps. |
+| `POST /v1/sbom?cache_only=true` | Install only a complete cached review; otherwise return 409 and preserve the active policy. No new AI calls or cache writes. |
 | `POST /v1/preview?cache_only=true` | Compare a candidate using cached knowledge, with no new AI work or cache writes by that request; live policy stays unchanged. |
 | `POST /v1/preview` | Preview with paid cache-miss analysis allowed; live policy stays unchanged. |
 | `GET /v1/traffic`, `POST /v1/traffic` | Read or set persistent `auto`, `filter` or `block_all` mode with an operator reason. |
-| `POST /v1/refresh` | Discard all cached reviews and research the installed inventory again; can incur full-inventory charges. |
+| `POST /v1/refresh` | When cache-only mode is disabled, discard all cached reviews and research the installed inventory again; can incur full-inventory charges. |
 
 Use the [API examples](docs/api.md) to upload raw JSON, preview candidates, read remediation reports and change traffic mode. Keep reports and credentials private. `filter` retains security filters; it is not an unconditional bypass.
 
@@ -171,7 +172,8 @@ Native runs load `.env` from their current working directory. Existing environme
 | `FILTR_AI_PROVIDER` | Optional primary-provider restriction: `openai` or `anthropic`. |
 | `FILTR_AI_MODEL` | Optional exact primary model override; otherwise use the best-ranked configured provider from the saved/uploaded leaderboard selection. |
 | `FILTR_AI_CACHE_TTL_SECS` | `86400` by default; expired reviews are automatically refreshed. `0` disables reuse and the expiry timer. |
-| `FILTR_AI_CACHE_ONLY` | Source builds after v0.1.1: `false` by default. Set `true` to use only valid cached reviews, with no provider/leaderboard calls or background research. Incomplete cache-only uploads are rejected without changing the installed policy. |
+| `FILTR_AI_CACHE_ONLY` | `false` by default. Set `true` to use only valid cached reviews, with no provider/leaderboard calls or background research. Incomplete cache-only uploads are rejected without changing the installed policy. |
+| `FILTR_AI_HTTP_RETRIES` | `2` by default; accepts 0–2 retries for provider HTTP 429/5xx. Set `0` to avoid repeated requests; search continuations and a configured backup remain possible. |
 | `FILTR_AUTO_BLOCK_CRITICAL` | `false` by default; opt in to qualifying AI emergency escalation. |
 | `FILTR_WEBHOOK_URL`, `FILTR_WEBHOOK_TOKEN` | Optional maintenance receiver and dedicated bearer secret; best-effort notifications. |
 | `FILTR_TRUSTED_PROXIES`, `FILTR_ALLOWED_HOSTS` | Exact trusted peer IPs and optional allowed public hostnames. |
@@ -195,9 +197,9 @@ These are **fresh paired controls**, not a comparison against the [earlier stand
 
 Linux perf profiles identified repeated byte scans, URL parsing and header allocation/copying. The optimized path combines NUL/escape detection, updates only the path/query of the validated upstream URL, and moves owned request/response headers. Filtering, decoding depth, limits, forwarding trust and traffic controls remain enforced. Validation passed 81 Rust tests plus 111 baseline/candidate HTTP cases with identical responses, including 83 rejections. First-party unsafe Rust remains forbidden. See the [profiling and validation summary](https://github.com/meiroio/filtr/blob/main/bench/results/2026-10-25-profile-arm64.json).
 
-The proxy still adds an HTTP hop and inspection. These closed-loop tests with a trivial origin are a development reference, not a production capacity or latency-SLA guarantee. TLS, real application work, large generated policies and AI review cost are outside this test. The optimized numbers were measured from a pre-release **source build** of the changes now shipped in **v0.1.1**; they are not a new measurement of the release artifacts.
+The proxy still adds an HTTP hop and inspection. These closed-loop tests with a trivial origin are a development reference, not a production capacity or latency-SLA guarantee. TLS, real application work, large generated policies and AI review cost are outside this test. The optimized numbers were measured from a pre-release **source build** of the changes now shipped in **v0.1.1**; they are not a new measurement of the release artifacts. **v0.1.2 has not been rebenchmarked.**
 
-Reproduce using Docker Compose and Python 3:
+Run the same workloads against v0.1.1 using Docker Compose and Python 3:
 
 ```sh
 git clone --depth 1 https://github.com/meiroio/filtr.git filtr-benchmark
@@ -208,7 +210,7 @@ python3 bench/run.py --image ghcr.io/meiroio/filtr:0.1.1 \
   --host-description 'Describe your CPU and RAM' --output data/benchmark
 ```
 
-The harness builds the demo/load-generator images, uses an isolated Docker network and makes no AI calls. Omitting `--image` selects the current release; omitting `--baseline-image` runs a single variant. See the [methodology](https://github.com/meiroio/filtr/blob/main/bench/README.md). Local raw reports and profiles stay under ignored `data/`.
+The harness builds the demo/load-generator images, uses an isolated Docker network and makes no AI calls. Omitting `--image` selects the current v0.1.2 release; omitting `--baseline-image` runs a single variant. See the [methodology](https://github.com/meiroio/filtr/blob/main/bench/README.md). Local raw reports and profiles stay under ignored `data/`.
 
 ## Agent instructions: operate Filtr through its APIs
 

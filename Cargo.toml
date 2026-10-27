@@ -1,6 +1,6 @@
 [package]
 name = "filtr"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "An SBOM-aware HTTP firewall reverse proxy"
 license = "PolyForm-Noncommercial-1.0.0"

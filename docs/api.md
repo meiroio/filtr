@@ -41,7 +41,7 @@ For Kubernetes, use the [Kubernetes port-forward instructions](kubernetes.md#ins
 
 ## Install using cached reviews only
 
-**Requires a source build after v0.1.1. Published v0.1.1 does not enforce cache-only uploads.** Verify the new `ai_mode` object is present in `GET /v1/status` before relying on this option.
+**Available in v0.1.2.** When connecting to an existing instance, verify that `GET /v1/status` includes `ai_mode` before relying on cache-only installation.
 
 `POST /v1/sbom?cache_only=true` compiles a candidate using only unexpired, matching cached reviews. It makes no provider, search or leaderboard calls and does not write or extend the review cache. Installation requires a complete cached review with no rejected proposals or unreviewed components. A missing/expired review returns **409** with `error: "cached-review-incomplete"`, `installed: false`, and the candidate `policy` and `inventory` diagnostics. The installed policy, saved SBOM and traffic mode stay unchanged, and no webhook is sent for a rejected candidate.
 

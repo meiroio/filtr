@@ -21,7 +21,7 @@ For example, a **source-justified** Brotli request restriction can use the follo
 }
 ```
 
-This is an API shape example, not a built-in Bun/CVE fix. In source builds after v0.1.1, Filtr checks this rule before decoding the incoming body; a match returns 403. Without the restriction, supported compressed bodies undergo bounded decompression and the same body inspection as ordinary requests. Once a truthful patched SBOM removes the applicable restriction, valid Brotli requests can reach the upstream again. Published v0.1.1 still has the earlier blanket 415 guard; see [HTTP behavior](operations.md#http-behavior).
+This is an API shape example, not a built-in Bun/CVE fix. In v0.1.2, Filtr checks this rule before decoding the incoming body; a match returns 403. Without the restriction, supported compressed bodies undergo bounded decompression and the same body inspection as ordinary requests. Once a truthful patched SBOM removes the applicable restriction, valid Brotli requests can reach the upstream again. See [HTTP behavior](operations.md#http-behavior).
 
 This mitigates the incoming request path identified by the rule. `Content-Encoding: br` describes an incoming Brotli body; `Accept-Encoding: br` asks for a compressed response and is not the same condition. Outgoing application connections and response-body processing are outside this ingress filter's scope. That boundary does not invalidate a targeted incoming-body mitigation. If application code decodes Brotli carried inside another format, such as a JSON field, a Content-Encoding rule alone does not identify that path; any additional restriction needs evidence about how that application accepts input.
 
@@ -66,7 +66,7 @@ Use `--ai-timeout-secs` / `FILTR_AI_TIMEOUT_SECS` for each provider attempt and 
 
 ## Research sources
 
-Source builds after v0.1.1 add [cve.now](https://cve.now/) to the research instructions shared by OpenAI and Anthropic, including backup attempts. Its [source reference](https://cve.now/llms.txt) describes aggregated CVE/advisory feeds, exploitation signals and labeled model-written summaries. Filtr uses it through provider-hosted web search, with no new service credentials or direct database client.
+Filtr v0.1.2 adds [cve.now](https://cve.now/) to the research instructions shared by OpenAI and Anthropic, including backup attempts. Its [source reference](https://cve.now/llms.txt) describes aggregated CVE/advisory feeds, exploitation signals and labeled model-written summaries. Filtr uses it through provider-hosted web search, with no new service credentials or direct database client.
 
 The AI is instructed to use one of its existing targeted searches for `site:cve.now` and the supplied package identities/versions. It then checks the original vendor/project advisories for affected ranges, fixed versions, exploit conditions and narrow HTTP mitigations, citing primary evidence retrieved by native search. Aggregated summaries, severity scores and exploitation labels are leads, not sufficient evidence for a blocking rule. Source selection and interpretation remain model assessments; Filtr validates the returned source provenance and rule structure, not the truth of an advisory.
 
@@ -84,8 +84,8 @@ Existing valid reviews are preserved by a narrowly scoped migration from the pre
 | `FILTR_AI_MODEL` | `--ai-model` | Unset: use leaderboard selection. Set an exact native model ID to pin the primary and skip leaderboard requests. |
 | `FILTR_AI_REASONING` | `--ai-reasoning` | Unset: use leaderboard effort for automatic selection, or provider defaults for a pinned model. Set a supported effort explicitly to override it. |
 | `FILTR_AI_CACHE_TTL_SECS` | `--ai-cache-ttl-secs` | `86400` (one day): reuse completed component reviews and automatically refresh expired entries. `0` disables cache reuse and the expiry timer. |
-| `FILTR_AI_CACHE_ONLY` | `--ai-cache-only` | Source builds after v0.1.1: `false`. Set `true` to forbid provider/search/leaderboard calls and automatic research; use matching unexpired cached reviews only. |
-| `FILTR_AI_HTTP_RETRIES` | `--ai-http-retries` | Source builds after v0.1.1: `2`. Additional retries for HTTP 429/5xx per provider request; accepts 0–2. Set `0` to send each request once. Provider web-search continuations are still part of the same review, and a configured backup can still run. |
+| `FILTR_AI_CACHE_ONLY` | `--ai-cache-only` | `false`. Set `true` to forbid provider/search/leaderboard calls and automatic research; use matching unexpired cached reviews only. |
+| `FILTR_AI_HTTP_RETRIES` | `--ai-http-retries` | `2`. Additional retries for HTTP 429/5xx per provider request; accepts 0–2. Set `0` to send each request once. Provider web-search continuations are still part of the same review, and a configured backup can still run. |
 
 Cache-only mode also applies on startup and to manual refresh requests. It does not clear or write the cache, fetch rankings, extend timestamps or turn missing reviews into a clean assessment. `GET /v1/status` exposes `ai_mode.cache_only`; preview results report the effective mode. Uploads require complete cached coverage and otherwise return 409 without changing the installed policy. See [cache-only installation](api.md#install-using-cached-reviews-only). The normal one-day refresh behavior resumes when this mode is disabled and Filtr restarts. This option is intended for controlled offline use and repeatable demonstrations; expired knowledge remains expired.
 

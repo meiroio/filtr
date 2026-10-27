@@ -59,22 +59,22 @@ Static mappings activate immediately after persistence and serve traffic through
 
 ## Docker
 
-The public `ghcr.io/meiroio/filtr:0.1.1` image already supports amd64 and arm64. Use the [Kubernetes deployment guide](kubernetes.md) to deploy it without a build. The following commands are for optional local development or publishing a customized image.
+The public `ghcr.io/meiroio/filtr:0.1.2` image already supports amd64 and arm64. Use the [Kubernetes deployment guide](kubernetes.md) to deploy it without a build. The following commands are for optional local development or publishing a customized image.
 
-The [Dockerfile](https://github.com/meiroio/filtr/blob/v0.1.1/Dockerfile) uses a Rust build stage and a Debian runtime with CA certificates and curl for authenticated loopback probes. The runtime runs as UID/GID `10001`, handles SIGTERM, and exposes only public port 8080. The build context is restricted by [.dockerignore](https://github.com/meiroio/filtr/blob/v0.1.1/.dockerignore); local SBOMs, tokens and data are not copied into the image. Build for the CPU architecture used by your cluster:
+The [Dockerfile](https://github.com/meiroio/filtr/blob/v0.1.2/Dockerfile) uses a Rust build stage and a Debian runtime with CA certificates and curl for authenticated loopback probes. The runtime runs as UID/GID `10001`, handles SIGTERM, and exposes only public port 8080. The build context is restricted by [.dockerignore](https://github.com/meiroio/filtr/blob/v0.1.2/.dockerignore); local SBOMs, tokens and data are not copied into the image. Build for the CPU architecture used by your cluster:
 
 ```sh
-docker build --pull -t filtr:0.1.1 .
+docker build --pull -t filtr:0.1.2 .
 
 # To publish for an amd64 Kubernetes cluster from any build machine:
-export FILTR_IMAGE=ghcr.io/YOUR_ORG/filtr:0.1.1
+export FILTR_IMAGE=ghcr.io/YOUR_ORG/filtr:0.1.2
 docker buildx build --platform linux/amd64 -t "$FILTR_IMAGE" --push .
 # For a mixed cluster, use --platform linux/amd64,linux/arm64.
 ```
 
 ### Local Compose demo
 
-[compose.yaml](https://github.com/meiroio/filtr/blob/v0.1.1/compose.yaml) starts Filtr and the harmless Rust demo upstream. It reads your existing `.env` for credentials and overrides the upstream/listener addresses for the private Docker network. Only Filtr's public port is published, on host loopback; the demo origin and admin listener are not published. Docker Compose's [`env_file` setting](https://docs.docker.com/compose/how-tos/environment-variables/set-environment-variables/) injects credentials at runtime.
+[compose.yaml](https://github.com/meiroio/filtr/blob/v0.1.2/compose.yaml) starts Filtr and the harmless Rust demo upstream. It reads your existing `.env` for credentials and overrides the upstream/listener addresses for the private Docker network. Only Filtr's public port is published, on host loopback; the demo origin and admin listener are not published. Docker Compose's [`env_file` setting](https://docs.docker.com/compose/how-tos/environment-variables/set-environment-variables/) injects credentials at runtime.
 
 Create `.env` from [.env.example](../.env.example) for a new checkout, or keep an existing configuration. Add your provider key(s) if using AI. Add an admin secret **only if one is missing**, then start:
 
@@ -132,7 +132,7 @@ docker run -d --name filtr --network app-network \
   --mount type=volume,source=filtr-data,target=/data \
   -e FILTR_ADMIN_TOKEN -e OPENAI_API_KEY -e ANTHROPIC_API_KEY \
   -e FILTR_AI_PROVIDER -e FILTR_UPSTREAM=http://app:3000 \
-  filtr:0.1.1
+  filtr:0.1.2
 
 # Admin stays on container loopback; write and upload as the runtime user.
 docker exec -i filtr sh -ec '

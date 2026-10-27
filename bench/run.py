@@ -15,7 +15,7 @@ import time
 
 ROOT = Path(__file__).resolve().parent.parent
 BASELINE_IMAGE = "ghcr.io/meiroio/filtr:0.1.0@sha256:5333b0a0101a08ee902c90e68bc36fa44eba1ec9948be050f65648837a52bc03"
-DEFAULT_IMAGE = "ghcr.io/meiroio/filtr:0.1.1"
+DEFAULT_IMAGE = "ghcr.io/meiroio/filtr:0.1.2"
 
 
 def command(args, *, prefix=(), **kwargs):

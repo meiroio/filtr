@@ -67,11 +67,15 @@ class DiscoveryTests(unittest.TestCase):
     def test_environment_file_is_data_and_never_shell(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "keys"
-            path.write_text("ANTHROPIC_API_KEY='$(touch /tmp/filtr-must-not-execute)'\nFILTR_AI_MODEL='chosen-model'\n")
+            path.write_text("ANTHROPIC_API_KEY='$(touch /tmp/filtr-must-not-execute)'\n"
+                            "FILTR_AI_MODEL='chosen-model'\nFILTR_AI_CACHE_ONLY=true\n"
+                            "FILTR_AI_HTTP_RETRIES=0\n")
             path.chmod(0o600)
             values = main.optional_env(path)
             self.assertTrue(values["ANTHROPIC_API_KEY"].startswith("$("))
             self.assertEqual(values["FILTR_AI_MODEL"], "chosen-model")
+            self.assertEqual(values["FILTR_AI_CACHE_ONLY"], "true")
+            self.assertEqual(values["FILTR_AI_HTTP_RETRIES"], "0")
             path.write_text("FILTR_UPSTREAM=http://attacker\n")
             with self.assertRaises(InstallError):
                 main.optional_env(path)
