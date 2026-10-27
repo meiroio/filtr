@@ -1,6 +1,6 @@
 use super::{
-    AiConfig, INSTRUCTIONS, LEGACY_INSTRUCTIONS, Proposal, Reply, ReviewTrigger, ReviewedBatch,
-    batches, legacy_output_schema, models::Target, output_schema, research,
+    AiConfig, INSTRUCTIONS, LEGACY_INSTRUCTIONS, Proposal, RESEARCH_GUIDANCE, Reply, ReviewTrigger,
+    ReviewedBatch, batches, legacy_output_schema, models::Target, output_schema, research,
 };
 use crate::policy::Report;
 use anyhow::{Context, Result, ensure};
@@ -61,13 +61,20 @@ pub(super) async fn clear(path: &Path) -> Result<()> {
 }
 
 fn scope(config: &AiConfig) -> Value {
+    let mut current = pre_cve_now_scope(config);
+    current["version"] = json!(3);
+    current["research_guidance"] = json!(RESEARCH_GUIDANCE);
+    current
+}
+
+fn pre_cve_now_scope(config: &AiConfig) -> Value {
     json!({"version":2,"instructions":INSTRUCTIONS,"schema":output_schema(),
         "provider":config.provider,"model":config.model,"reasoning":config.reasoning,
         "openai_url":config.url.as_str(),"anthropic_url":config.anthropic_url.as_str()})
 }
 
 fn legacy_scope(config: &AiConfig) -> Value {
-    let mut previous = scope(config);
+    let mut previous = pre_cve_now_scope(config);
     previous["version"] = json!(1);
     previous["instructions"] = json!(LEGACY_INSTRUCTIONS);
     previous["schema"] = legacy_output_schema();
@@ -165,6 +172,10 @@ impl Store {
                     finding.coverage_note = "Legacy cached finding: advisory only; no narrow mitigation was reviewed. Re-evaluate at normal expiry or request an explicit refresh.".into();
                 }
             }
+            data.scope = expected.clone();
+        } else if data.scope == pre_cve_now_scope(config) {
+            // This additive source change keeps v2's enforcement contract and original review age.
+            // Reassess this migration before future research-guidance or validation changes.
             data.scope = expected.clone();
         }
         let data = if data.scope == expected {
@@ -394,6 +405,146 @@ mod tests {
             &crate::policy::Catalog::bundled().unwrap(),
         )
         .unwrap()
+    }
+
+    fn pre_source_cache(config: &AiConfig, checked: u64) -> Value {
+        let key = component_key(&policy("2.14.1").report, 0).unwrap();
+        json!({"scope":pre_cve_now_scope(config),"entries":{key:{"checked_at":checked,
+            "target":{"provider":"openai","model":"existing-model","reasoning":"default","rank":2},
+            "sources":["https://vendor.example/advisory"],
+            "reply":{"summary":"Existing completed review.",
+                "enhancements":[{"component_index":0,"basis":"log4shell-lookups","action":"tokens",
+                    "patterns":["existing-marker"],"reason":"Existing evidence."}],
+                "discoveries":[{"component_index":0,"cve":"CVE-2026-12345",
+                    "source":"https://vendor.example/advisory","reason":"Existing affected-version evidence.",
+                    "fixed_version":"2.26.0","coverage_note":"Existing protection limits.",
+                    "restriction":{"methods":["POST"],"path_prefix":"/affected",
+                        "headers":[{"name":"x-test-vector","kind":"exact","value":"enabled"}],
+                        "body_patterns":["existing-signature"]},
+                    "emergency":{"critical":true,"remotely_exploitable":true,
+                        "authentication_required":false,"actively_exploited":true,"affects_http1_upstream":true,
+                        "source":"https://vendor.example/advisory","reason":"Existing emergency assessment."}}]}}}})
+    }
+
+    #[tokio::test]
+    async fn v2_source_migration_preserves_entries_age_and_read_only_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache.json");
+        let config = AiConfig::default();
+        let policy = policy("2.14.1");
+        let checked = now().unwrap() - 120;
+        let document = pre_source_cache(&config, checked);
+        assert_eq!(document["scope"]["version"], 2);
+        assert!(document["scope"].get("research_guidance").is_none());
+        let original: Data = serde_json::from_value(document.clone()).unwrap();
+        let before = serde_json::to_vec_pretty(&document).unwrap();
+        std::fs::write(&path, &before).unwrap();
+        let mut store = Store::load(&path, &config, ReviewTrigger::Preview { cache_only: true })
+            .await
+            .unwrap();
+        assert_eq!(store.data.scope, scope(&config));
+        assert_eq!(
+            serde_json::to_value(&store.data.entries).unwrap(),
+            serde_json::to_value(&original.entries).unwrap()
+        );
+        let mut stats = Stats::default();
+        let replies = store.reuse(&policy.report, &mut stats).unwrap();
+        assert_eq!((stats.hits, stats.misses), (1, 0));
+        assert_eq!(stats.oldest_checked_at, Some(checked));
+        assert_eq!(stats.next_refresh_at, Some(checked + config.cache_ttl_secs));
+        let original = original.entries.values().next().unwrap();
+        assert_eq!(
+            serde_json::to_value(&replies[0].reply.enhancements).unwrap(),
+            serde_json::to_value(&original.reply.enhancements).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&replies[0].reply.discoveries).unwrap(),
+            serde_json::to_value(&original.reply.discoveries).unwrap()
+        );
+        let mut review = Review {
+            status: Status::Complete,
+            cache: stats,
+            ..Default::default()
+        };
+        store.finish(&path, &replies, &mut review).await;
+        assert_eq!(review.cache.oldest_checked_at, Some(checked));
+        assert_eq!(
+            review.cache.next_refresh_at,
+            Some(checked + config.cache_ttl_secs)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn v2_source_migration_does_not_revalidate_expired_or_future_reviews() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache.json");
+        let config = AiConfig::default();
+        let policy = policy("2.14.1");
+        let current = now().unwrap();
+        for checked in [current - config.cache_ttl_secs, current + 3600] {
+            let before = serde_json::to_vec(&pre_source_cache(&config, checked)).unwrap();
+            std::fs::write(&path, &before).unwrap();
+            let mut store =
+                Store::load(&path, &config, ReviewTrigger::Preview { cache_only: true })
+                    .await
+                    .unwrap();
+            let mut stats = Stats::default();
+            assert!(store.reuse(&policy.report, &mut stats).unwrap().is_empty());
+            assert_eq!((stats.hits, stats.misses), (0, 1));
+            assert!(stats.oldest_checked_at.is_none());
+            assert!(stats.next_refresh_at.is_none());
+            assert_eq!(
+                store.data.entries.values().next().unwrap().checked_at,
+                checked
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn source_migration_requires_exact_old_and_current_scopes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache.json");
+        let config = AiConfig::default();
+        let policy = policy("2.14.1");
+        let changes = [
+            (
+                "instructions",
+                json!(format!("{INSTRUCTIONS} Changed policy.")),
+            ),
+            ("schema", json!({"changed":true})),
+            ("provider", json!("anthropic")),
+            ("model", json!("another-model")),
+            ("reasoning", json!("high")),
+            ("openai_url", json!("https://another-openai.example/")),
+            ("anthropic_url", json!("https://another-anthropic.example/")),
+            ("version", json!(4)),
+            (
+                "research_guidance",
+                json!(format!("{RESEARCH_GUIDANCE} Changed research.")),
+            ),
+        ];
+        for base in [pre_cve_now_scope(&config), scope(&config)] {
+            for (field, value) in &changes {
+                let mut document = pre_source_cache(&config, now().unwrap());
+                document["scope"] = base.clone();
+                document["scope"][field] = value.clone();
+                let before = serde_json::to_vec(&document).unwrap();
+                std::fs::write(&path, &before).unwrap();
+                let mut store =
+                    Store::load(&path, &config, ReviewTrigger::Preview { cache_only: true })
+                        .await
+                        .unwrap();
+                let mut stats = Stats::default();
+                assert!(
+                    store.reuse(&policy.report, &mut stats).unwrap().is_empty(),
+                    "{field}"
+                );
+                assert_eq!((stats.hits, stats.misses), (0, 1), "{field}");
+                assert_eq!(std::fs::read(&path).unwrap(), before, "{field}");
+            }
+        }
     }
 
     #[tokio::test]

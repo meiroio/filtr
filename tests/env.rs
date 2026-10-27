@@ -100,3 +100,36 @@ fn precedence_is_cli_then_process_environment_then_dotenv() {
         assert!(!stderr.contains("private-test-key"));
     }
 }
+
+#[test]
+fn cache_only_environment_is_explicit_boolean_and_defaults_off() {
+    assert!(!filtr::ai::AiConfig::default().cache_only);
+    let directory = tempfile::tempdir().unwrap();
+    let help = command(directory.path()).arg("--help").output().unwrap();
+    assert!(help.status.success());
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("--ai-cache-only"));
+    assert!(help.contains("FILTR_AI_CACHE_ONLY"));
+    for setting in ["true", "false", "invalid"] {
+        std::fs::write(
+            directory.path().join(".env"),
+            format!("FILTR_AI_CACHE_ONLY={setting}\n"),
+        )
+        .unwrap();
+        let output = command(directory.path())
+            .env("FILTR_UPSTREAM", "http://127.0.0.1:1")
+            .env("FILTR_ADMIN_TOKEN", "deliberately-invalid-token")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if setting == "invalid" {
+            assert!(stderr.contains("--ai-cache-only"));
+            assert!(stderr.contains("invalid"));
+        } else {
+            // Parsing succeeded; configuration validation stops before binding
+            // listeners or starting any review/provider request.
+            assert!(stderr.contains("admin token must contain"), "{stderr}");
+        }
+    }
+}

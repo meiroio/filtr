@@ -36,6 +36,8 @@ pub(crate) fn validate_service_config(
 pub(crate) fn service_client(timeout_secs: u64) -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .no_proxy()
+        // AI and webhook callers enforce their own explicit retry budgets.
+        .retry(reqwest::retry::never())
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(3))
         .timeout(Duration::from_secs(timeout_secs))

@@ -76,7 +76,7 @@ pub(super) fn override_target(config: &AiConfig) -> Result<Option<Target>> {
         "AI model prefix conflicts with configured provider"
     );
     ensure!(
-        config.key(provider).is_some(),
+        config.cache_only || config.key(provider).is_some(),
         "the overridden model's provider has no API key"
     );
     ensure!(

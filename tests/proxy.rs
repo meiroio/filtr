@@ -173,14 +173,7 @@ impl Harness {
     }
 
     async fn upload(&self, sbom: &str) -> reqwest::Response {
-        self.client
-            .post(format!("{}/v1/sbom", self.admin))
-            .bearer_auth(TOKEN)
-            .header("content-type", "application/json")
-            .body(sbom.to_owned())
-            .send()
-            .await
-            .unwrap()
+        upload_options(self, sbom, "").await
     }
 
     async fn preview(&self, sbom: &str, cache_only: bool) -> Value {
@@ -244,6 +237,8 @@ async fn echo(request: Request) -> Response {
         Json(json!({
             "uri": parts.uri.to_string(), "method": parts.method.to_string(),
             "body": String::from_utf8_lossy(&body),
+            "body_bytes": body.to_vec(),
+            "content_encoding": parts.headers.get(header::CONTENT_ENCODING).and_then(|v| v.to_str().ok()),
             "forwarded_for": parts.headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()),
             "host": parts.headers.get("host").and_then(|v| v.to_str().ok()),
             "scheme": parts.headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()),
@@ -475,6 +470,376 @@ async fn saves_uploads_and_restores_policy_after_restart() {
     assert_eq!(restarted.hits.load(Ordering::SeqCst), 0);
 }
 
+struct CompressedBodyFixture {
+    encoding: &'static str,
+    benign: &'static [u8],
+    marker: &'static [u8],
+    nul: &'static [u8],
+    at_limit: &'static [u8],
+    over_limit: &'static [u8],
+}
+
+// Encoded with Bun 1.4.4's node:zlib. Decoded bodies are, respectively:
+// 96 deterministic alphanumeric bytes; the existing inert ${jndi:test} marker;
+// "benign\0body"; 1024 'x' bytes; and 1025 'x' bytes. All three benign wire
+// representations contain NUL bytes, which must not be scanned as plaintext.
+const COMPRESSED_BODY_FIXTURES: &[CompressedBodyFixture] = &[
+    CompressedBodyFixture {
+        encoding: "br",
+        benign: &[
+            27, 95, 0, 248, 101, 112, 94, 204, 135, 226, 182, 219, 13, 112, 137, 132, 82, 212, 48,
+            232, 253, 219, 59, 232, 220, 207, 45, 188, 158, 140, 255, 40, 44, 202, 202, 213, 92,
+            154, 57, 228, 100, 174, 242, 7, 210, 186, 102, 179, 177, 176, 74, 189, 118, 118, 163,
+            176, 210, 50, 157, 242, 76, 111, 244, 12, 91, 206, 196, 245, 118, 129, 66, 16, 189,
+            202, 189, 233, 147, 8, 184, 136, 8, 160, 100, 71, 88, 162, 87, 247, 243, 2,
+        ],
+        marker: &[
+            139, 5, 128, 36, 123, 106, 110, 100, 105, 58, 116, 101, 115, 116, 125, 3,
+        ],
+        nul: &[
+            11, 5, 128, 98, 101, 110, 105, 103, 110, 0, 98, 111, 100, 121, 3,
+        ],
+        at_limit: &[27, 255, 3, 248, 37, 240, 162, 177, 64, 32, 55],
+        over_limit: &[27, 0, 4, 248, 37, 240, 162, 177, 64, 64, 55],
+    },
+    CompressedBodyFixture {
+        encoding: "gzip",
+        benign: &[
+            31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 51, 43, 170, 44, 202, 116, 10, 44, 43, 47, 115, 173,
+            8, 246, 48, 170, 114, 14, 75, 78, 73, 13, 242, 14, 50, 51, 47, 246, 136, 204, 75, 77,
+            42, 119, 50, 243, 241, 14, 176, 136, 112, 45, 112, 207, 242, 46, 201, 204, 113, 45, 48,
+            243, 48, 138, 202, 77, 74, 244, 73, 247, 73, 52, 204, 47, 137, 12, 10, 46, 114, 53,
+            117, 118, 114, 174, 240, 44, 43, 244, 201, 117, 115, 180, 12, 55, 14, 117, 114, 15, 8,
+            55, 140, 244, 73, 45, 43, 175, 0, 0, 63, 24, 237, 228, 96, 0, 0, 0,
+        ],
+        marker: &[
+            31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 83, 169, 206, 202, 75, 201, 180, 42, 73, 45, 46, 169,
+            5, 0, 40, 152, 17, 51, 12, 0, 0, 0,
+        ],
+        nul: &[
+            31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 75, 74, 205, 203, 76, 207, 99, 72, 202, 79, 169, 4, 0,
+            104, 120, 247, 137, 11, 0, 0, 0,
+        ],
+        at_limit: &[
+            31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 171, 168, 24, 5, 163, 96, 20, 84, 140, 80, 0, 0, 99,
+            240, 215, 72, 0, 4, 0, 0,
+        ],
+        over_limit: &[
+            31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 171, 168, 24, 5, 163, 96, 20, 84, 140, 84, 0, 0, 145,
+            241, 47, 88, 1, 4, 0, 0,
+        ],
+    },
+    CompressedBodyFixture {
+        encoding: "deflate",
+        benign: &[
+            120, 156, 51, 43, 170, 44, 202, 116, 10, 44, 43, 47, 115, 173, 8, 246, 48, 170, 114,
+            14, 75, 78, 73, 13, 242, 14, 50, 51, 47, 246, 136, 204, 75, 77, 42, 119, 50, 243, 241,
+            14, 176, 136, 112, 45, 112, 207, 242, 46, 201, 204, 113, 45, 48, 243, 48, 138, 202, 77,
+            74, 244, 73, 247, 73, 52, 204, 47, 137, 12, 10, 46, 114, 53, 117, 118, 114, 174, 240,
+            44, 43, 244, 201, 117, 115, 180, 12, 55, 14, 117, 114, 15, 8, 55, 140, 244, 73, 45, 43,
+            175, 0, 0, 70, 198, 32, 166,
+        ],
+        marker: &[
+            120, 156, 83, 169, 206, 202, 75, 201, 180, 42, 73, 45, 46, 169, 5, 0, 28, 248, 4, 188,
+        ],
+        nul: &[
+            120, 156, 75, 74, 205, 203, 76, 207, 99, 72, 202, 79, 169, 4, 0, 24, 212, 4, 34,
+        ],
+        at_limit: &[
+            120, 156, 171, 168, 24, 5, 163, 96, 20, 84, 140, 80, 0, 0, 44, 79, 224, 16,
+        ],
+        over_limit: &[
+            120, 156, 171, 168, 24, 5, 163, 96, 20, 84, 140, 84, 0, 0, 12, 230, 224, 136,
+        ],
+    },
+];
+
+#[tokio::test]
+async fn compressed_requests_inspect_decoded_body_and_preserve_wire_envelope() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = Harness::start(&directory.path().join("sbom.json")).await;
+    assert_eq!(app.upload(VULNERABLE).await.status(), StatusCode::OK);
+    for fixture in COMPRESSED_BODY_FIXTURES {
+        assert!(fixture.benign.contains(&0));
+        let response = app
+            .client
+            .post(&app.public)
+            .header(header::CONTENT_ENCODING, fixture.encoding)
+            .body(fixture.benign)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "{}",
+            fixture.encoding
+        );
+        let forwarded: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+        assert_eq!(forwarded["body_bytes"], json!(fixture.benign));
+        assert_eq!(forwarded["content_encoding"], fixture.encoding);
+        for (name, body) in [
+            ("rule marker", fixture.marker),
+            ("decoded NUL", fixture.nul),
+        ] {
+            let response = app
+                .client
+                .post(&app.public)
+                .header(header::CONTENT_ENCODING, fixture.encoding)
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "{} {name}",
+                fixture.encoding
+            );
+        }
+    }
+    assert_eq!(app.hits.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn compressed_requests_bound_wire_and_decoded_size() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = Harness::start(&directory.path().join("sbom.json")).await;
+    assert_eq!(app.upload(PATCHED).await.status(), StatusCode::OK);
+    for fixture in COMPRESSED_BODY_FIXTURES {
+        for (name, body, expected) in [
+            (
+                "at decoded limit",
+                fixture.at_limit.to_vec(),
+                StatusCode::CREATED,
+            ),
+            (
+                "over decoded limit",
+                fixture.over_limit.to_vec(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+            (
+                "over wire limit",
+                vec![b'x'; 1025],
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+        ] {
+            let response = app
+                .client
+                .post(&app.public)
+                .header(header::CONTENT_ENCODING, fixture.encoding)
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{} {name}", fixture.encoding);
+        }
+    }
+    assert_eq!(app.hits.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn compressed_requests_reject_malformed_truncated_and_trailing_data() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = Harness::start(&directory.path().join("sbom.json")).await;
+    assert_eq!(app.upload(PATCHED).await.status(), StatusCode::OK);
+    for fixture in COMPRESSED_BODY_FIXTURES {
+        for (name, body) in [
+            ("empty", Vec::new()),
+            ("malformed", vec![255; 4]),
+            (
+                "truncated",
+                fixture.benign[..fixture.benign.len() - 1].to_vec(),
+            ),
+            ("trailing garbage", [fixture.benign, b"trailing"].concat()),
+        ] {
+            let response = app
+                .client
+                .post(&app.public)
+                .header(header::CONTENT_ENCODING, fixture.encoding)
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{} {name}",
+                fixture.encoding
+            );
+        }
+        if fixture.encoding != "gzip" {
+            let response = app
+                .client
+                .post(&app.public)
+                .header(header::CONTENT_ENCODING, fixture.encoding)
+                .body([fixture.benign, fixture.benign].concat())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{} concatenated streams",
+                fixture.encoding
+            );
+        }
+    }
+    assert_eq!(app.hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn compressed_requests_inspect_all_gzip_members_with_aggregate_limit() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = Harness::start(&directory.path().join("sbom.json")).await;
+    assert_eq!(app.upload(VULNERABLE).await.status(), StatusCode::OK);
+    let fixture = COMPRESSED_BODY_FIXTURES
+        .iter()
+        .find(|fixture| fixture.encoding == "gzip")
+        .unwrap();
+    let benign = [fixture.benign, fixture.benign].concat();
+    let response = app
+        .client
+        .post(&app.public)
+        .header(header::CONTENT_ENCODING, "gzip")
+        .body(benign.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let forwarded: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+    assert_eq!(forwarded["body_bytes"], json!(benign));
+    assert_eq!(forwarded["content_encoding"], "gzip");
+    for (name, body, expected) in [
+        (
+            "marker in second member",
+            [fixture.benign, fixture.marker].concat(),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "NUL in second member",
+            [fixture.benign, fixture.nul].concat(),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "aggregate decoded limit",
+            [fixture.at_limit, fixture.benign].concat(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+        (
+            "trailing garbage",
+            [fixture.benign, fixture.benign, b"trailing"].concat(),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let response = app
+            .client
+            .post(&app.public)
+            .header(header::CONTENT_ENCODING, "gzip")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{name}");
+    }
+    assert_eq!(app.hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn compressed_requests_honor_kill_switch_changed_during_body_upload() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = Harness::start(&directory.path().join("sbom.json")).await;
+    assert_eq!(app.upload(PATCHED).await.status(), StatusCode::OK);
+    let fixture = COMPRESSED_BODY_FIXTURES
+        .iter()
+        .find(|fixture| fixture.encoding == "gzip")
+        .unwrap();
+    let mut stream = TcpStream::connect(app.addr).await.unwrap();
+    let headers = format!(
+        "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        fixture.benign.len(),
+    );
+    stream.write_all(headers.as_bytes()).await.unwrap();
+    let split = fixture.benign.len() / 2;
+    stream.write_all(&fixture.benign[..split]).await.unwrap();
+    app.wait_for("/counters/seen", json!(1)).await;
+
+    assert_eq!(app.traffic("block_all").await["effective"], "blocked");
+    stream.write_all(&fixture.benign[split..]).await.unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        stream.read_to_end(&mut response),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        response.starts_with(b"HTTP/1.1 403"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    assert_eq!(app.hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn compressed_requests_reject_ambiguous_or_unsupported_codings() {
+    let directory = tempfile::tempdir().unwrap();
+    let app = Harness::start(&directory.path().join("sbom.json")).await;
+    assert_eq!(app.upload(PATCHED).await.status(), StatusCode::OK);
+    for encoding in [
+        "compress",
+        "zstd",
+        "gzip, br",
+        "identity, gzip",
+        "gzip, gzip",
+    ] {
+        let response = app
+            .client
+            .post(&app.public)
+            .header(header::CONTENT_ENCODING, encoding)
+            .body("body")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "{encoding}"
+        );
+    }
+    for second in ["br", "gzip"] {
+        let response = app
+            .client
+            .post(&app.public)
+            .header(header::CONTENT_ENCODING, "br")
+            .header(header::CONTENT_ENCODING, second)
+            .body("body")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "duplicate br/{second}"
+        );
+    }
+    for connection in ["close, Content-Encoding", "close, Content-Type"] {
+        let response = app
+            .client
+            .post(&app.public)
+            .header(header::CONTENT_ENCODING, "br")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .header(header::CONNECTION, connection)
+            .body(COMPRESSED_BODY_FIXTURES[0].benign)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{connection}");
+    }
+    assert_eq!(app.hits.load(Ordering::SeqCst), 0);
+}
+
 #[tokio::test]
 async fn refuses_uninspectable_envelopes_and_bounds_body_size() {
     let directory = tempfile::tempdir().unwrap();
@@ -486,14 +851,14 @@ async fn refuses_uninspectable_envelopes_and_bounds_body_size() {
                 .post(&app.public)
                 .header("content-encoding", "gzip")
                 .body("compressed"),
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            StatusCode::BAD_REQUEST,
         ),
         (
             app.client
                 .post(&app.public)
                 .header("content-encoding", "br")
                 .body("harmless Brotli envelope test"),
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            StatusCode::BAD_REQUEST,
         ),
         (
             app.client
@@ -641,6 +1006,18 @@ fn review_text(enhancements: Value) -> String {
         .to_string()
 }
 
+fn assert_cve_now_research_guidance(instructions: &str) {
+    let guidance = instructions
+        .split_once("site:cve.now")
+        .expect("research must include a targeted cve.now search")
+        .1
+        .to_ascii_lowercase();
+    assert!(guidance.contains("primary") && guidance.contains("advis"));
+    assert!(guidance.contains("check") || guidance.contains("verif"));
+    assert!(guidance.contains("native web search"));
+    assert!(instructions.contains("at most 3 searches per batch"));
+}
+
 #[tokio::test]
 async fn anthropic_discovers_missing_cves_with_search_provenance_and_cached_continuation() {
     let directory = tempfile::tempdir().unwrap();
@@ -656,6 +1033,10 @@ async fn anthropic_discovers_missing_cves_with_search_provenance_and_cached_cont
             let searched = searched.clone();
             async move {
                 assert_eq!(request["cache_control"]["type"], "ephemeral");
+                assert_eq!(request["system"][0]["cache_control"]["type"], "ephemeral");
+                assert_cve_now_research_guidance(request["system"][0]["text"].as_str().unwrap());
+                assert_eq!(request["tools"][0]["type"], "web_search_20250305");
+                assert_eq!(request["tools"][0]["max_uses"], 5);
                 assert_eq!(request["tools"][1]["strict"], true);
                 match count.fetch_add(1, Ordering::SeqCst) {
                     0 => Json(json!({"id":"paused","stop_reason":"pause_turn","content":searched,
@@ -734,7 +1115,10 @@ async fn anthropic_discovers_missing_cves_with_search_provenance_and_cached_cont
 async fn openai_discoveries_require_native_web_search_sources() {
     let directory = tempfile::tempdir().unwrap();
     let ai = Router::new().route("/v1/responses", post(|Json(request): Json<Value>| async move {
+        assert_cve_now_research_guidance(request["instructions"].as_str().unwrap());
         assert_eq!(request["tools"][0]["type"], "web_search");
+        assert_eq!(request["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(request["max_tool_calls"], 5);
         assert_eq!(request["include"], json!(["web_search_call.action.sources"]));
         Json(json!({"id":"researched","status":"completed","output":[
             {"type":"web_search_call","status":"completed","action":{"sources":[{"url":"https://vendor.example/security/advisory"}]}},
@@ -791,7 +1175,11 @@ async fn anthropic_uses_its_ranked_model_and_native_structured_output() {
             assert_eq!(request["output_config"]["effort"], "max");
             assert_eq!(request["cache_control"]["type"], "ephemeral");
             assert_eq!(request["system"][0]["cache_control"]["type"], "ephemeral");
+            assert_cve_now_research_guidance(request["system"][0]["text"].as_str().unwrap());
             assert_eq!(request["tools"][0]["name"], "web_search");
+            assert_eq!(request["tools"][0]["type"], "web_search_20250305");
+            assert_eq!(request["tools"][0]["max_uses"], 5);
+            assert_eq!(request["tools"].as_array().unwrap().len(), 2);
             assert_eq!(request["tools"][1]["name"], "submit_review");
             assert_eq!(request["tools"][1]["strict"], true);
             let input: Value = serde_json::from_str(request["messages"][0]["content"].as_str().unwrap()).unwrap();
@@ -1587,6 +1975,102 @@ async fn manual_traffic_mode_persists_and_resumes_filters_without_bypass() {
     );
     assert_eq!(restarted.status().await["traffic"]["mode"], "filter");
     task.abort();
+}
+
+#[tokio::test]
+async fn scoped_brotli_rule_blocks_before_decoding_and_patched_sbom_restores_requests() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut response = targeted_reply();
+    let mut payload: Value = serde_json::from_str(
+        response["output"][1]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    payload["discoveries"][0]["restriction"]["headers"] =
+        json!([{"name":"content-encoding","kind":"exact","value":"br"}]);
+    payload["discoveries"][0]["coverage_note"] =
+        json!("Synthetic fixture restricts incoming Brotli-encoded requests only.");
+    response["output"][1]["content"][0]["text"] = json!(payload.to_string());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let ai = Router::new().route(
+        "/v1/responses",
+        post(move |Json(request): Json<Value>| {
+            let response = response.clone();
+            let count = count.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                let input: Value =
+                    serde_json::from_str(request["input"][0]["content"].as_str().unwrap()).unwrap();
+                Json(if input["components"][0]["version"] == "1.0.0.RELEASE" {
+                    response
+                } else {
+                    openai_reply(json!([]))
+                })
+            }
+        }),
+    );
+    let app = Harness::start_with_services(&directory.path().join("sbom.json"), Some(ai)).await;
+    assert_eq!(app.upload(PREVIEW_OLD).await.status(), StatusCode::OK);
+    assert_eq!(
+        app.status().await["policy"]["generated_rules"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let fixture = &COMPRESSED_BODY_FIXTURES[0];
+    for body in [fixture.benign, b"malformed Brotli fixture".as_slice()] {
+        let response = app
+            .client
+            .post(&app.public)
+            .header(header::CONTENT_ENCODING, "br")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+    assert_eq!(
+        app.client
+            .post(&app.public)
+            .header(header::CONTENT_ENCODING, "identity")
+            .body("normal traffic")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(app.hits.load(Ordering::SeqCst), 1);
+
+    assert_eq!(app.upload(PREVIEW_NEW).await.status(), StatusCode::OK);
+    assert_eq!(app.status().await["policy"]["generated_rules"], json!([]));
+    let response = app
+        .client
+        .post(&app.public)
+        .header(header::CONTENT_ENCODING, "br")
+        .body(fixture.benign)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let forwarded: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+    assert_eq!(forwarded["body_bytes"], json!(fixture.benign));
+    assert_eq!(forwarded["content_encoding"], "br");
+    assert_eq!(
+        app.client
+            .post(&app.public)
+            .body("normal traffic")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(app.hits.load(Ordering::SeqCst), 3);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -2551,6 +3035,462 @@ async fn pinned_models_reuse_component_reviews_across_uploads_and_offline_restar
             .status(),
         StatusCode::CREATED
     );
+}
+
+async fn cached_review_fixture() -> (
+    tempfile::TempDir,
+    Harness,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let ranks = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let rankings = ranks.clone();
+    let ai = Router::new()
+        .route(
+            "/leaderboard",
+            get(move || {
+                rankings.fetch_add(1, Ordering::SeqCst);
+                async { Json(test_leaderboard()) }
+            }),
+        )
+        .route(
+            "/v1/responses",
+            post(move || {
+                let call = count.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    Json(if call == 0 {
+                        targeted_reply()
+                    } else {
+                        openai_reply(json!([]))
+                    })
+                }
+            }),
+        );
+    let app = Harness::start_configured(
+        &directory.path().join("sbom.json"),
+        Some(ai),
+        filtr::ai::AiConfig {
+            api_key: Some("test-key".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(app.upload(PREVIEW_OLD).await.status(), StatusCode::OK);
+    assert_eq!(
+        app.preview(PREVIEW_NEW, false).await["analysis_complete"],
+        true
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(ranks.load(Ordering::SeqCst), 1);
+    (directory, app, calls, ranks)
+}
+
+async fn upload_options(app: &Harness, sbom: &str, options: &str) -> reqwest::Response {
+    let url = if options.is_empty() {
+        format!("{}/v1/sbom", app.admin)
+    } else {
+        format!("{}/v1/sbom?{options}", app.admin)
+    };
+    app.client
+        .post(url)
+        .bearer_auth(TOKEN)
+        .header("content-type", "application/json")
+        .body(sbom.to_owned())
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn cache_only_upload_replays_versions_without_external_calls_or_cache_writes() {
+    let (directory, app, calls, ranks) = cached_review_fixture().await;
+    let path = directory.path().join("sbom.json");
+    let cache = directory.path().join("sbom.json.ai-cache.json");
+    let rankings = directory.path().join("sbom.json.leaderboard.json");
+    let cache_bytes = std::fs::read(&cache).unwrap();
+    let cache_modified = std::fs::metadata(&cache).unwrap().modified().unwrap();
+    let ranking_bytes = std::fs::read(&rankings).unwrap();
+    for (sbom, expected) in [
+        (PREVIEW_OLD, StatusCode::FORBIDDEN),
+        (PREVIEW_NEW, StatusCode::CREATED),
+        (PREVIEW_OLD, StatusCode::FORBIDDEN),
+    ] {
+        let response = upload_options(&app, sbom, "cache_only=true").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let report: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+        assert_eq!(report["installed"], true);
+        assert_eq!(report["cache_only"], true);
+        assert_eq!(report["policy"]["ai"]["status"], "complete");
+        assert_eq!(report["policy"]["ai"]["cache"]["hits"], 1);
+        assert_eq!(report["policy"]["ai"]["attempts"], json!([]));
+        assert_eq!(report["policy"]["ai"]["usage"]["web_search_requests"], 0);
+        assert_eq!(
+            app.client
+                .get(&app.public)
+                .header("x-test-exploit", "yes")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            expected
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), sbom);
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(ranks.load(Ordering::SeqCst), 1);
+    assert_eq!(std::fs::read(&cache).unwrap(), cache_bytes);
+    assert_eq!(
+        std::fs::metadata(&cache).unwrap().modified().unwrap(),
+        cache_modified
+    );
+    assert_eq!(std::fs::read(&rankings).unwrap(), ranking_bytes);
+}
+
+#[tokio::test]
+async fn previous_v2_cache_only_upload_replays_rules_without_external_calls() {
+    let (directory, app, calls, ranks) = cached_review_fixture().await;
+    let cache_path = directory.path().join("sbom.json.ai-cache.json");
+    let rankings_path = directory.path().join("sbom.json.leaderboard.json");
+    let original_rules = app.status().await["policy"]["generated_rules"].clone();
+    assert_eq!(original_rules.as_array().unwrap().len(), 1);
+
+    let mut previous: Value = serde_json::from_slice(&std::fs::read(&cache_path).unwrap()).unwrap();
+    let scope = previous["scope"].as_object_mut().unwrap();
+    assert!(scope.remove("research_guidance").is_some());
+    scope.insert("version".into(), json!(2));
+    let previous_bytes = serde_json::to_vec(&previous).unwrap();
+    std::fs::write(&cache_path, &previous_bytes).unwrap();
+    let modified = std::fs::metadata(&cache_path).unwrap().modified().unwrap();
+    let rankings_bytes = std::fs::read(&rankings_path).unwrap();
+
+    for (sbom, expected, rules) in [
+        (PREVIEW_OLD, StatusCode::FORBIDDEN, original_rules.clone()),
+        (PREVIEW_NEW, StatusCode::CREATED, json!([])),
+        (PREVIEW_OLD, StatusCode::FORBIDDEN, original_rules),
+    ] {
+        let response = upload_options(&app, sbom, "cache_only=true").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let report: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+        assert_eq!(report["installed"], true);
+        assert_eq!(report["cache_only"], true);
+        assert_eq!(report["policy"]["generated_rules"], rules);
+        assert_eq!(report["policy"]["ai"]["status"], "complete");
+        assert_eq!(report["policy"]["ai"]["cache"]["hits"], 1);
+        assert_eq!(report["policy"]["ai"]["cache"]["misses"], 0);
+        assert_eq!(report["policy"]["ai"]["attempts"], json!([]));
+        assert_eq!(report["policy"]["ai"]["usage"]["web_search_requests"], 0);
+        assert_eq!(
+            app.client
+                .get(&app.public)
+                .header("x-test-exploit", "yes")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            expected
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(ranks.load(Ordering::SeqCst), 1);
+    }
+    assert_eq!(std::fs::read(&cache_path).unwrap(), previous_bytes);
+    assert_eq!(
+        std::fs::metadata(&cache_path).unwrap().modified().unwrap(),
+        modified
+    );
+    assert_eq!(std::fs::read(&rankings_path).unwrap(), rankings_bytes);
+}
+
+#[tokio::test]
+async fn cache_only_upload_rejections_preserve_live_policy_files_and_webhooks() {
+    let (directory, warm, calls, ranks) = cached_review_fixture().await;
+    let path = directory.path().join("sbom.json");
+    let cache = directory.path().join("sbom.json.ai-cache.json");
+    let rankings = directory.path().join("sbom.json.leaderboard.json");
+    let (url, mut events, task) = recording_webhook(StatusCode::NO_CONTENT).await;
+    let mut config = warm.ai_config.clone();
+    config.cache_only = true;
+    let app = Harness::start_configured_with_webhook(
+        &path,
+        None,
+        config,
+        filtr::webhook::Config {
+            webhook_url: Some(url),
+            ..Default::default()
+        },
+    )
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let live = app.status().await["policy"].clone();
+    let saved = std::fs::read(&path).unwrap();
+    let ranking_bytes = std::fs::read(&rankings).unwrap();
+    let saved_modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let rankings_modified = std::fs::metadata(&rankings).unwrap().modified().unwrap();
+    let original_cache: Value = serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
+    for mode in ["missing", "expired", "rejected"] {
+        let mut candidate_cache = original_cache.clone();
+        let entries = candidate_cache["entries"].as_object_mut().unwrap();
+        let key = entries
+            .keys()
+            .find(|key| key.contains("1.0.1.RELEASE"))
+            .unwrap()
+            .clone();
+        match mode {
+            "missing" => {
+                entries.remove(&key);
+            }
+            "expired" => entries[&key]["checked_at"] = json!(0),
+            _ => {
+                entries[&key]["reply"]["enhancements"] = json!([{
+                    "component_index":0,"basis":"not-an-enabled-rule","action":"tokens",
+                    "patterns":["untrusted-marker"],"reason":"Invalid cached proposal must fail validation."
+                }])
+            }
+        }
+        std::fs::write(&cache, serde_json::to_vec(&candidate_cache).unwrap()).unwrap();
+        let cache_bytes = std::fs::read(&cache).unwrap();
+        let cache_modified = std::fs::metadata(&cache).unwrap().modified().unwrap();
+        let response = upload_options(&app, PREVIEW_NEW, "cache_only=true").await;
+        assert_eq!(response.status(), StatusCode::CONFLICT, "{mode}");
+        let report: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+        assert_eq!(report["installed"], false);
+        assert_eq!(report["error"], "cached-review-incomplete");
+        assert_eq!(report["cache_only"], true);
+        assert_eq!(app.status().await["policy"], live);
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+        assert_eq!(std::fs::read(&cache).unwrap(), cache_bytes);
+        assert_eq!(std::fs::read(&rankings).unwrap(), ranking_bytes);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            saved_modified
+        );
+        assert_eq!(
+            std::fs::metadata(&cache).unwrap().modified().unwrap(),
+            cache_modified
+        );
+        assert_eq!(
+            std::fs::metadata(&rankings).unwrap().modified().unwrap(),
+            rankings_modified
+        );
+        assert_eq!(
+            app.client
+                .get(&app.public)
+                .header("x-test-exploit", "yes")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    for query in [
+        "cache_onyl=true",
+        "cache_only=invalid",
+        "cache_only=true&cache_only=false",
+        "other=1",
+    ] {
+        assert_eq!(
+            upload_options(&app, PREVIEW_NEW, query).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(ranks.load(Ordering::SeqCst), 1);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), events.recv())
+            .await
+            .is_err()
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn global_cache_only_restores_without_keys_and_cannot_be_bypassed() {
+    let (directory, warm, calls, ranks) = cached_review_fixture().await;
+    let path = directory.path().join("sbom.json");
+    let cache = directory.path().join("sbom.json.ai-cache.json");
+    let rankings = directory.path().join("sbom.json.leaderboard.json");
+    let cache_bytes = std::fs::read(&cache).unwrap();
+    let ranking_bytes = std::fs::read(&rankings).unwrap();
+    let mut config = warm.ai_config.clone();
+    config.cache_only = true;
+    config.api_key = None;
+    config.anthropic_api_key = None;
+    let app = Harness::start_configured(&path, None, config).await;
+    let initial = app.status().await;
+    assert_eq!(initial["ai_mode"]["cache_only"], true);
+    assert_eq!(initial["policy"]["ai"]["status"], "complete");
+    assert_eq!(initial["policy"]["ai"]["cache"]["hits"], 1);
+    assert_eq!(initial["policy"]["ai"]["attempts"], json!([]));
+    assert_eq!(
+        app.client
+            .get(&app.public)
+            .header("x-test-exploit", "yes")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let preview = app.preview(PREVIEW_NEW, false).await;
+    assert_eq!(preview["cache_only"], true);
+    assert_eq!(preview["analysis_complete"], true);
+    let refreshed = app
+        .admin_report(app.client.post(format!("{}/v1/refresh", app.admin)))
+        .await;
+    assert_eq!(refreshed["policy"]["ai"]["attempts"], json!([]));
+    let missing = r#"{"format":"filtr-1","packages":[{"purl":"pkg:npm/uncached@1.0.0"}]}"#;
+    for options in ["", "cache_only=false"] {
+        let response = upload_options(&app, missing, options).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let result: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+        assert_eq!(result["installed"], false);
+        assert_eq!(result["cache_only"], true);
+    }
+    let installed: Value =
+        serde_json::from_slice(&app.upload(PREVIEW_NEW).await.bytes().await.unwrap()).unwrap();
+    assert_eq!(installed["installed"], true);
+    assert_eq!(installed["cache_only"], true);
+    assert_eq!(
+        app.client
+            .get(&app.public)
+            .header("x-test-exploit", "yes")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::CREATED
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), PREVIEW_NEW);
+    assert_eq!(std::fs::read(&cache).unwrap(), cache_bytes);
+    assert_eq!(std::fs::read(&rankings).unwrap(), ranking_bytes);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(ranks.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn global_cache_only_does_not_refresh_expired_reviews_even_with_credentials() {
+    let (directory, warm, calls, ranks) = cached_review_fixture().await;
+    let path = directory.path().join("sbom.json");
+    let cache = directory.path().join("sbom.json.ai-cache.json");
+    let mut config = warm.ai_config.clone();
+    config.cache_only = true;
+    config.cache_ttl_secs = 2;
+    let app = Harness::start_configured(&path, None, config).await;
+    assert_eq!(app.status().await["policy"]["ai"]["status"], "complete");
+    let cache_bytes = std::fs::read(&cache).unwrap();
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let preview = app.preview(PREVIEW_OLD, false).await;
+    assert_eq!(preview["analysis_complete"], false);
+    assert_eq!(preview["candidate"]["policy"]["ai"]["status"], "partial");
+    assert_eq!(preview["candidate"]["policy"]["ai"]["cache"]["hits"], 0);
+    assert_eq!(app.upload(PREVIEW_OLD).await.status(), StatusCode::CONFLICT);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(ranks.load(Ordering::SeqCst), 1);
+    assert_eq!(std::fs::read(&cache).unwrap(), cache_bytes);
+    assert_eq!(
+        app.client
+            .get(&app.public)
+            .header("x-test-exploit", "yes")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn global_cache_only_accepts_pinned_provider_scope_without_credentials() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sbom.json");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let ai = Router::new().route(
+        "/v1/responses",
+        post(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            async { Json(targeted_reply()) }
+        }),
+    );
+    let warm = Harness::start_configured(
+        &path,
+        Some(ai),
+        filtr::ai::AiConfig {
+            api_key: Some("test-key".into()),
+            model: Some("openai/cached-pinned-model".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(warm.upload(PREVIEW_OLD).await.status(), StatusCode::OK);
+    let cache = directory.path().join("sbom.json.ai-cache.json");
+    let original = std::fs::read(&cache).unwrap();
+    let mut config = warm.ai_config.clone();
+    config.api_key = None;
+    config.cache_only = true;
+    let app = Harness::start_configured(&path, None, config).await;
+    assert_eq!(app.status().await["policy"]["ai"]["status"], "complete");
+    assert_eq!(app.status().await["policy"]["ai"]["cache"]["hits"], 1);
+    assert_eq!(
+        app.client
+            .get(&app.public)
+            .header("x-test-exploit", "yes")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(std::fs::read(&cache).unwrap(), original);
+}
+
+#[tokio::test]
+async fn global_cache_only_startup_reports_missing_coverage_and_keeps_static_filtering() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("sbom.json");
+    std::fs::write(&path, VULNERABLE).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let ai = Router::new().fallback(move || {
+        count.fetch_add(1, Ordering::SeqCst);
+        async { StatusCode::BAD_GATEWAY }
+    });
+    let app = Harness::start_configured(
+        &path,
+        Some(ai),
+        filtr::ai::AiConfig {
+            cache_only: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    let report = app.status().await;
+    assert_eq!(report["ai_mode"]["cache_only"], true);
+    assert_eq!(report["policy"]["ai"]["status"], "partial");
+    assert_eq!(report["policy"]["ai"]["unreviewed_components"], json!([0]));
+    assert_eq!(report["policy"]["ai"]["attempts"], json!([]));
+    assert_eq!(
+        app.client
+            .post(&app.public)
+            .body("${jndi:test}")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(app.upload(PATCHED).await.status(), StatusCode::CONFLICT);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), VULNERABLE);
+    assert!(!directory.path().join("sbom.json.ai-cache.json").exists());
+    assert!(!directory.path().join("sbom.json.leaderboard.json").exists());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

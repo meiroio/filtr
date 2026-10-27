@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod ai;
+mod encoding;
 pub mod forwarding;
 pub mod generated;
 mod network;
@@ -152,6 +153,7 @@ pub struct AppState {
     traffic: traffic::Controller,
     counters: Counters,
     requests: Arc<Semaphore>,
+    decoders: Arc<Semaphore>,
     admin_requests: Arc<Semaphore>,
     updates: Arc<Mutex<()>>,
 }
@@ -201,6 +203,7 @@ impl AppState {
             .build()?;
         let state = Arc::new(Self {
             requests: Arc::new(Semaphore::new(config.max_in_flight)),
+            decoders: Arc::new(Semaphore::new(config.max_in_flight.min(4))),
             admin_requests: Arc::new(Semaphore::new(8)),
             config,
             catalog,
@@ -391,6 +394,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Response {
         "ready": policy.is_some(),
         "inventory": policy.as_ref().map(|p| remediation::inventory(&p.report)),
         "policy": policy.as_ref().map(|p| &p.report),
+        "ai_mode": {"cache_only": state.config.ai.cache_only},
         "traffic": state.traffic.report(policy.is_some()),
         "limits": {"body_bytes": state.config.max_body_bytes, "timeout_secs": state.config.timeout_secs, "max_in_flight": state.config.max_in_flight},
         "counters": {
@@ -427,41 +431,63 @@ fn persist(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+enum Installation {
+    Installed(Arc<Policy>),
+    CachedReviewIncomplete(Arc<Policy>),
+}
+
 async fn install(
     state: Arc<AppState>,
     bytes: axum::body::Bytes,
     _guard: tokio::sync::OwnedMutexGuard<()>,
-) -> Result<Arc<Policy>> {
+    cache_only: bool,
+) -> Result<Installation> {
     let saved_state = state.clone();
+    let candidate_bytes = bytes.clone();
     let mut policy = tokio::task::spawn_blocking(move || {
-        let components = sbom::parse(&bytes)?;
+        let components = sbom::parse(&candidate_bytes)?;
         let policy = Policy::compile(components, &saved_state.catalog)?;
-        persist(&saved_state.config.sbom, &bytes)?;
+        if !cache_only {
+            persist(&saved_state.config.sbom, &candidate_bytes)?;
+        }
         Ok::<_, anyhow::Error>(policy)
     })
     .await
     .context("SBOM compilation task failed")??;
-    // Static mappings remain active until an AI review succeeds, even after disconnect.
-    state.policy.store(Some(Arc::new(policy.clone())));
-    tracing::info!(
-        components = policy.report.components.len(),
-        active_rules = policy.report.active_rules.len(),
-        "SBOM policy activated"
-    );
-    policy.report.ai = state.ai.pending_review();
-    state.policy.store(Some(Arc::new(policy.clone())));
-    state
-        .ai
-        .enhance(&mut policy, ai::ReviewTrigger::SbomUpdate)
-        .await;
+    let trigger = if cache_only {
+        ai::ReviewTrigger::Preview { cache_only: true }
+    } else {
+        // Ordinary updates activate static mappings while their AI review runs.
+        state.policy.store(Some(Arc::new(policy.clone())));
+        tracing::info!(
+            components = policy.report.components.len(),
+            active_rules = policy.report.active_rules.len(),
+            "SBOM policy activated"
+        );
+        policy.report.ai = state.ai.pending_review();
+        state.policy.store(Some(Arc::new(policy.clone())));
+        ai::ReviewTrigger::SbomUpdate
+    };
+    state.ai.enhance(&mut policy, trigger).await;
+    if cache_only {
+        if !matches!(policy.report.ai.status, ai::Status::Complete) {
+            return Ok(Installation::CachedReviewIncomplete(Arc::new(policy)));
+        }
+        let path = state.config.sbom.clone();
+        tokio::task::spawn_blocking(move || persist(&path, &bytes)).await??;
+    }
     state.traffic.observe(&policy.report).await;
     let policy = Arc::new(policy);
     state.policy.store(Some(policy.clone()));
     state.notify("sbom_update");
-    Ok(policy)
+    Ok(Installation::Installed(policy))
 }
 
 async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    let Some(cache_only) = preview::cache_only_option(request.uri().query()) else {
+        return error(StatusCode::BAD_REQUEST, "invalid-sbom-options");
+    };
+    let cache_only = cache_only || state.config.ai.cache_only;
     let Ok(update_guard) = state.updates.clone().try_lock_owned() else {
         return error(StatusCode::CONFLICT, "sbom-update-in-progress");
     };
@@ -469,9 +495,22 @@ async fn upload(State(state): State<Arc<AppState>>, request: Request) -> Respons
         Ok(bytes) => bytes,
         Err((status, code)) => return error(status, code),
     };
-    let result = tokio::spawn(install(state, bytes, update_guard)).await;
+    let result = tokio::spawn(install(state.clone(), bytes, update_guard, cache_only)).await;
     match result {
-        Ok(Ok(policy)) => Json(json!({"ready": true, "inventory": remediation::inventory(&policy.report), "policy": policy.report})).into_response(),
+        Ok(Ok(Installation::Installed(policy))) => {
+            let mut response = json!({"ready": true, "inventory": remediation::inventory(&policy.report), "policy": policy.report});
+            if cache_only {
+                response["installed"] = json!(true);
+                response["cache_only"] = json!(true);
+            }
+            Json(response).into_response()
+        }
+        Ok(Ok(Installation::CachedReviewIncomplete(policy))) => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "cached-review-incomplete", "installed": false, "cache_only": true,
+                "ready": state.policy.load().is_some(), "inventory": remediation::inventory(&policy.report),
+                "policy": policy.report})),
+        ).into_response(),
         Ok(Err(error)) => {
             let status = if error.downcast_ref::<std::io::Error>().is_some()
                 || error.downcast_ref::<tempfile::PersistError>().is_some()

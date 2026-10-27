@@ -39,6 +39,18 @@ ssh -N -L 9090:127.0.0.1:9090 operator@filtr-host
 
 For Kubernetes, use the [Kubernetes port-forward instructions](kubernetes.md#install-secrets-storage-and-policy). The loopback-only admin API is never added to the public Service or ingress.
 
+## Install using cached reviews only
+
+**Requires a source build after v0.1.1. Published v0.1.1 does not enforce cache-only uploads.** Verify the new `ai_mode` object is present in `GET /v1/status` before relying on this option.
+
+`POST /v1/sbom?cache_only=true` compiles a candidate using only unexpired, matching cached reviews. It makes no provider, search or leaderboard calls and does not write or extend the review cache. Installation requires a complete cached review with no rejected proposals or unreviewed components. A missing/expired review returns **409** with `error: "cached-review-incomplete"`, `installed: false`, and the candidate `policy` and `inventory` diagnostics. The installed policy, saved SBOM and traffic mode stay unchanged, and no webhook is sent for a rejected candidate.
+
+On success, the complete policy replaces the live policy without an intermediate static-only policy. The response includes `installed: true` and `cache_only: true`; the saved SBOM and normal installation notification are updated. For example, use the upload command above with URL `'http://127.0.0.1:9090/v1/sbom?cache_only=true'`. Unknown or duplicate query options return 400.
+
+To prevent AI calls across the whole instance, including startup and the independent expiry timer, set **`FILTR_AI_CACHE_ONLY=true`** and recreate/restart Filtr. Status then reports `ai_mode.cache_only: true`. In this mode every upload requires complete cached coverage, even if a caller supplies `cache_only=false`. Reviews can be reused without provider credentials if the cache scope matches. Cache age and TTL still apply: this mode neither renews timestamps nor treats an expired review as current. Initial startup can report partial cached coverage; an SBOM or successful startup is not proof of a complete review.
+
+Agents recording a demo should preview both inventories with `cache_only=true`, verify the expected generated rule and current coverage, then use cache-only installation for each transition. Never manufacture a cached finding, edit its check time, or silently extend TTL to make a recording pass. Updating an SBOM describes a software change; it does not deploy that change. Label historical-inventory replay explicitly.
+
 ## Preview an SBOM before deployment
 
 Authenticated `POST /v1/preview` accepts the same raw SBOM JSON as `/v1/sbom` and compares the candidate with the currently installed policy. It never installs the candidate, changes the saved SBOM, publishes a pending live policy, refreshes the leaderboard, or sends webhooks. It also works before the first upload, with `baseline: null`; public traffic still requires an installed SBOM.

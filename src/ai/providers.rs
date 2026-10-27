@@ -1,4 +1,7 @@
-use super::{AiConfig, INSTRUCTIONS, Provider, Reply, models::Target, output_schema, research};
+use super::{
+    AiConfig, INSTRUCTIONS, Provider, RESEARCH_GUIDANCE, Reply, models::Target, output_schema,
+    research,
+};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -98,12 +101,12 @@ async fn send_request(
     body: &Value,
 ) -> Result<reqwest::Response> {
     let started = std::time::Instant::now();
-    for attempt in 0..3 {
+    for attempt in 0..=config.http_retries {
         let response = build_request(http, config, target, body)?
             .send()
             .await
             .map_err(|_| anyhow::anyhow!("AI provider request failed or timed out"))?;
-        if attempt == 2
+        if attempt == config.http_retries
             || !(response.status().as_u16() == 429 || response.status().is_server_error())
         {
             return Ok(response);
@@ -122,7 +125,7 @@ async fn send_request(
         }
         tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
     }
-    unreachable!()
+    anyhow::bail!("AI HTTP retry budget exhausted")
 }
 
 fn build_request(
@@ -147,10 +150,11 @@ fn build_request(
 }
 
 fn request_body(target: &Target, input: &str) -> Value {
+    let instructions = format!("{INSTRUCTIONS}\n\n{RESEARCH_GUIDANCE}");
     let mut body = match target.provider {
         Provider::Openai => json!({
             "model":target.model, "reasoning":{"effort":target.reasoning}, "store":false,
-            "max_output_tokens":16384, "instructions":INSTRUCTIONS,
+            "max_output_tokens":16384, "instructions":instructions,
             "tools":[{"type":"web_search"}], "max_tool_calls":5,
             "include":["web_search_call.action.sources"],
             "input":[{"role":"user", "content":input}],
@@ -158,7 +162,7 @@ fn request_body(target: &Target, input: &str) -> Value {
         }),
         Provider::Anthropic => json!({
             "model":target.model, "max_tokens":16384, "cache_control":{"type":"ephemeral"},
-            "system":[{"type":"text", "text":INSTRUCTIONS, "cache_control":{"type":"ephemeral"}}],
+            "system":[{"type":"text", "text":instructions, "cache_control":{"type":"ephemeral"}}],
             "thinking":{"type":"adaptive"}, "output_config":{"effort":target.reasoning},
             "tool_choice":{"type":"auto", "disable_parallel_tool_use":true},
             "tools":[{"type":"web_search_20250305", "name":"web_search", "max_uses":5},
@@ -188,4 +192,56 @@ fn collect_text<'a>(
         }
     }
     Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Router, http::StatusCode, routing::post};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[tokio::test]
+    async fn retry_budget_bounds_provider_http_requests() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = hits.clone();
+        let service = Router::new().route(
+            "/v1/messages",
+            post(move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+                async { (StatusCode::SERVICE_UNAVAILABLE, [("retry-after", "1")]) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, service).await.unwrap() });
+        let mut config = AiConfig {
+            anthropic_api_key: Some("test-key".into()),
+            anthropic_url: endpoint.parse().unwrap(),
+            ai_timeout_secs: 10,
+            ..AiConfig::default()
+        };
+        assert_eq!(config.http_retries, 2);
+        let target = Target {
+            provider: Provider::Anthropic,
+            model: "test-model".into(),
+            reasoning: "default".into(),
+            rank: None,
+        };
+        let client = crate::network::service_client(10).unwrap();
+        for retries in [0, 2] {
+            config.http_retries = retries;
+            hits.store(0, Ordering::SeqCst);
+            let response = send_request(&client, &config, &target, &json!({}))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(hits.load(Ordering::SeqCst), usize::from(retries) + 1);
+        }
+        config.http_retries = 3;
+        assert!(config.validate().is_err());
+        server.abort();
+    }
 }

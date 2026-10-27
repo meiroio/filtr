@@ -1,6 +1,10 @@
-use crate::{AppState, block, error};
+use crate::{
+    AppState, block,
+    encoding::{self, DecodeError, Encoding},
+    error,
+};
 use axum::{
-    body::{Body, to_bytes},
+    body::{Body, Bytes, to_bytes},
     extract::{ConnectInfo, Request, State},
     http::{HeaderMap, HeaderName, Method, StatusCode, Uri, header},
     response::Response,
@@ -8,8 +12,11 @@ use axum::{
 use futures_util::StreamExt;
 use std::{
     net::SocketAddr,
-    sync::{Arc, atomic::Ordering},
-    time::Duration,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 const MAX_HEADER_BYTES: usize = 32 * 1024;
@@ -89,14 +96,18 @@ fn unsafe_envelope(request: &Request) -> Option<(StatusCode, &'static str)> {
     {
         return Some((StatusCode::BAD_REQUEST, "method-override-not-supported"));
     }
-    if headers
-        .get_all(header::CONTENT_ENCODING)
-        .iter()
-        .any(|v| !v.as_bytes().eq_ignore_ascii_case(b"identity"))
-    {
+    if headers.get_all(header::CONNECTION).iter().any(|value| {
+        value.to_str().is_ok_and(|value| {
+            value.split(',').any(|name| {
+                name.trim().eq_ignore_ascii_case("content-encoding")
+                    || name.trim().eq_ignore_ascii_case("content-type")
+            })
+        })
+    }) {
+        // Hop-header stripping must not change how upstream interprets inspected bytes.
         return Some((
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "encoded-body-not-supported",
+            StatusCode::BAD_REQUEST,
+            "connection-nominates-content-metadata",
         ));
     }
     if headers.get_all(header::CONTENT_TYPE).iter().any(|v| {
@@ -129,6 +140,53 @@ fn upstream_url(origin: &reqwest::Url, uri: &Uri) -> reqwest::Url {
     url
 }
 
+struct CancelDecode(Arc<AtomicBool>);
+
+impl Drop for CancelDecode {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+async fn inspectable_body(
+    state: &AppState,
+    encoding: Encoding,
+    bytes: Bytes,
+) -> Result<Bytes, DecodeError> {
+    if encoding == Encoding::Identity {
+        return Ok(bytes);
+    }
+    let permit = state
+        .decoders
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| DecodeError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            reason: "body-decode-capacity-exceeded",
+        })?;
+    let cancellation = CancelDecode(Arc::new(AtomicBool::new(false)));
+    let flag = cancellation.0.clone();
+    let timeout = Duration::from_secs(state.config.timeout_secs);
+    let deadline = Instant::now() + timeout;
+    let limit = state.config.max_body_bytes;
+    let task = tokio::task::spawn_blocking(move || {
+        // A dropped/expired async request cannot release capacity while CPU work runs.
+        let _permit = permit;
+        encoding::decode(encoding, &bytes, limit, deadline, &flag).map(Bytes::from)
+    });
+    match tokio::time::timeout(timeout, task).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(DecodeError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            reason: "body-decode-failed",
+        }),
+        Err(_) => Err(DecodeError {
+            status: StatusCode::REQUEST_TIMEOUT,
+            reason: "body-decode-timeout",
+        }),
+    }
+}
+
 pub(crate) async fn forward(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -153,6 +211,10 @@ pub(crate) async fn forward(
     if let Some((status, code)) = unsafe_envelope(&request) {
         return block(&state, status, code);
     }
+    let encoding = match Encoding::parse(request.headers()) {
+        Ok(encoding) => encoding,
+        Err(error) => return block(&state, error.status, error.reason),
+    };
     let metadata = match crate::forwarding::Metadata::read(
         &state.config.forwarding,
         request.headers(),
@@ -191,6 +253,10 @@ pub(crate) async fn forward(
             "read-method-body-not-supported",
         );
     }
+    let inspected = match inspectable_body(&state, encoding, bytes.clone()).await {
+        Ok(body) => body,
+        Err(error) => return block(&state, error.status, error.reason),
+    };
     let Some(policy) = state.policy.load_full() else {
         return block(&state, StatusCode::SERVICE_UNAVAILABLE, "sbom-required");
     };
@@ -198,7 +264,7 @@ pub(crate) async fn forward(
         return block(&state, StatusCode::FORBIDDEN, reason);
     }
     if let Some(rule) =
-        policy.inspect_request(&parts.method, parts.uri.path(), &parts.headers, &bytes)
+        policy.inspect_request(&parts.method, parts.uri.path(), &parts.headers, &inspected)
     {
         return block(&state, StatusCode::FORBIDDEN, rule);
     }
@@ -218,9 +284,10 @@ pub(crate) async fn forward(
             return block(&state, StatusCode::FORBIDDEN, rule);
         }
     }
-    if let Some(rule) = policy.inspect_bytes(&bytes, false) {
+    if let Some(rule) = policy.inspect_bytes(&inspected, false) {
         return block(&state, StatusCode::FORBIDDEN, rule);
     }
+    drop(inspected);
     let url = upstream_url(&state.config.upstream, &parts.uri);
     let mut headers = parts.headers;
     strip_hop_headers(&mut headers);
@@ -275,6 +342,100 @@ pub(crate) async fn forward(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn abandoned_decode_requests_keep_capacity_until_workers_exit() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        runtime.block_on(async {
+            let state = AppState::new(crate::Config {
+                listen: "127.0.0.1:8080".parse().unwrap(),
+                admin_listen: "127.0.0.1:9090".parse().unwrap(),
+                upstream: "http://127.0.0.1:3000".parse().unwrap(),
+                admin_token: "a".repeat(128),
+                sbom: directory.path().join("missing-sbom.json"),
+                rules: None,
+                forwarding: Default::default(),
+                ai: crate::ai::AiConfig {
+                    cache_ttl_secs: 0,
+                    ..Default::default()
+                },
+                webhook: Default::default(),
+                auto_block_critical: false,
+                max_body_bytes: 1024,
+                timeout_secs: 1,
+                max_in_flight: 1,
+            })
+            .await
+            .unwrap();
+            for abort_request in [true, false] {
+                let (release, waiting) = std::sync::mpsc::channel();
+                let (started, start) = tokio::sync::oneshot::channel();
+                let occupied = tokio::task::spawn_blocking(move || {
+                    let _ = started.send(());
+                    // A failed assertion cannot leave runtime shutdown waiting forever.
+                    let _ = waiting.recv_timeout(Duration::from_secs(5));
+                });
+                tokio::time::timeout(Duration::from_secs(2), start)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let worker_state = state.clone();
+                let request = tokio::spawn(async move {
+                    inspectable_body(
+                        &worker_state,
+                        Encoding::Gzip,
+                        Bytes::from_static(&[
+                            31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        ]),
+                    )
+                    .await
+                });
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while state.decoders.available_permits() != 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                if abort_request {
+                    request.abort();
+                    assert!(request.await.unwrap_err().is_cancelled());
+                } else {
+                    let error = request.await.unwrap().unwrap_err();
+                    assert_eq!(error.status, StatusCode::REQUEST_TIMEOUT);
+                    assert_eq!(error.reason, "body-decode-timeout");
+                }
+                assert_eq!(state.decoders.available_permits(), 0);
+                let error = inspectable_body(&state, Encoding::Gzip, Bytes::new())
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(error.reason, "body-decode-capacity-exceeded");
+                assert_eq!(
+                    inspectable_body(&state, Encoding::Identity, Bytes::from_static(b"plain"))
+                        .await
+                        .unwrap(),
+                    "plain"
+                );
+                release.send(()).unwrap();
+                occupied.await.unwrap();
+                let permit = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    state.decoders.clone().acquire_owned(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                drop(permit);
+                assert_eq!(state.decoders.available_permits(), 1);
+            }
+        });
+    }
 
     #[test]
     fn upstream_setters_preserve_serialization_and_fixed_authority() {

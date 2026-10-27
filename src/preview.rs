@@ -15,12 +15,19 @@ use std::{
     sync::Arc,
 };
 
+pub(crate) fn cache_only_option(query: Option<&str>) -> Option<bool> {
+    match query {
+        None | Some("") | Some("cache_only=false") => Some(false),
+        Some("cache_only=true") => Some(true),
+        _ => None,
+    }
+}
+
 pub(crate) async fn preview(State(state): State<Arc<AppState>>, request: Request) -> Response {
-    let cache_only = match request.uri().query() {
-        None | Some("") | Some("cache_only=false") => false,
-        Some("cache_only=true") => true,
-        _ => return error(StatusCode::BAD_REQUEST, "invalid-preview-options"),
+    let Some(cache_only) = cache_only_option(request.uri().query()) else {
+        return error(StatusCode::BAD_REQUEST, "invalid-preview-options");
     };
+    let cache_only = cache_only || state.config.ai.cache_only;
     // Serialize cache writers and freeze the baseline without publishing a pending policy.
     let Ok(guard) = state.updates.clone().try_lock_owned() else {
         return error(StatusCode::CONFLICT, "sbom-update-in-progress");

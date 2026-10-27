@@ -1,6 +1,6 @@
 # Filtr
 
-[Simple mode](#simple-mode) · [Kubernetes](#kubernetes-mode) · [Filtering](#how-filtering-works) · [API](#api-reference) · [Configuration](#configuration) · [Performance](#performance) · [Agent instructions](#agent-instructions-operate-filtr-through-its-apis) · [Docs](#documentation) · [License](#limits-and-license)
+[Simple mode](#simple-mode) · [Kubernetes](#kubernetes-mode) · [Filtering](#how-filtering-works) · [API](#api-reference) · [Configuration](#configuration) · [Performance](#performance) · [Agent instructions](#agent-instructions-operate-filtr-through-its-apis) · [Demo](demo/README.md) · [Docs](#documentation) · [License](#limits-and-license)
 
 ![Filtr](filtr.png)
 
@@ -133,7 +133,11 @@ For original client IP/HTTPS forwarding, configure the actual ingress socket-pee
 
 Filtr accepts HTTP/1.0 and HTTP/1.1 over TCP and forwards HTTP/1.1 to a fixed HTTP(S) upstream. An existing ingress or web server handles public TLS. Uploading an SBOM activates matching curated filters and runs configured AI analysis, reusing valid component reviews. OpenAI or Anthropic hosted search supplies automatic vulnerability discovery; there is no advisory-database lookup engine.
 
+Source builds after v0.1.1 instruct both providers to include [cve.now](https://cve.now/) in discovery, then cross-check affected versions and request mitigations against primary advisories. This uses the existing search budget and takes effect on new or expired reviews; valid cached reviews retain their original expiry. See [research sources](docs/ai.md#research-sources) for evidence, privacy and fallback behavior.
+
 Validated AI restrictions target request methods, paths, headers or body markers. Findings without supported narrow protection appear in `uncovered_vulnerabilities` and optional SRE webhook notifications. They do not quarantine every vulnerable dependency. Broad AI read-only/deny-all enhancements are rejected. Curated token heuristics remain implemented; legacy broad catalogue entries are advisory-only.
+
+Source builds after v0.1.1 inspect incoming Brotli, gzip and zlib-wrapped deflate bodies under explicit size and decoder limits, then forward the original bytes. An applicable vulnerability rule can block a particular encoding before decompression; removing that restriction after a verified patch restores valid requests. The published v0.1.1 packages still reject compressed request bodies. See [HTTP behavior](docs/operations.md#http-behavior) for bounds and supported formats.
 
 Default traffic mode is `auto` with `FILTR_AUTO_BLOCK_CRITICAL=false`. `POST /v1/traffic` can select `block_all` to stop new requests, `filter` to resume targeted protection, or `auto` to resume configured automation. Opt-in critical escalation requires an AI assessment of active exploitation, unauthenticated remote critical impact on the HTTP/1 upstream and no narrow mitigation. Operator blocking persists across uploads and restarts. Missing, failed or partial AI does not clear an established emergency decision.
 
@@ -167,6 +171,7 @@ Native runs load `.env` from their current working directory. Existing environme
 | `FILTR_AI_PROVIDER` | Optional primary-provider restriction: `openai` or `anthropic`. |
 | `FILTR_AI_MODEL` | Optional exact primary model override; otherwise use the best-ranked configured provider from the saved/uploaded leaderboard selection. |
 | `FILTR_AI_CACHE_TTL_SECS` | `86400` by default; expired reviews are automatically refreshed. `0` disables reuse and the expiry timer. |
+| `FILTR_AI_CACHE_ONLY` | Source builds after v0.1.1: `false` by default. Set `true` to use only valid cached reviews, with no provider/leaderboard calls or background research. Incomplete cache-only uploads are rejected without changing the installed policy. |
 | `FILTR_AUTO_BLOCK_CRITICAL` | `false` by default; opt in to qualifying AI emergency escalation. |
 | `FILTR_WEBHOOK_URL`, `FILTR_WEBHOOK_TOKEN` | Optional maintenance receiver and dedicated bearer secret; best-effort notifications. |
 | `FILTR_TRUSTED_PROXIES`, `FILTR_ALLOWED_HOSTS` | Exact trusted peer IPs and optional allowed public hostnames. |
@@ -380,6 +385,8 @@ Substitute `/v1/status` or `/v1/rules` for other read-only reports. Use the [SBO
 - [AI providers, model overrides and cache](docs/ai.md)
 - [Infrastructure, HTTP behavior and curated catalogue](docs/operations.md)
 - [Source builds, Docker, tests and memory-safety policy](docs/development.md)
+- [Two-tab terminal presentation, local Docker checks and recording commands](demo/README.md)
+- [Four-minute English video script](docs/video-script-en.md)
 
 ## Limits and license
 
