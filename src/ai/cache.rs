@@ -1,6 +1,7 @@
 use super::{
     AiConfig, INSTRUCTIONS, LEGACY_INSTRUCTIONS, Proposal, RESEARCH_GUIDANCE, Reply, ReviewTrigger,
-    ReviewedBatch, batches, legacy_output_schema, models::Target, output_schema, research,
+    ReviewedBatch, ZERO_WIRE_RESEARCH_GUIDANCE, batches, legacy_output_schema, models::Target,
+    output_schema, research,
 };
 use crate::policy::Report;
 use anyhow::{Context, Result, ensure};
@@ -61,6 +62,13 @@ pub(super) async fn clear(path: &Path) -> Result<()> {
 }
 
 fn scope(config: &AiConfig) -> Value {
+    let mut current = pre_zero_wire_scope(config);
+    current["version"] = json!(4);
+    current["zero_wire_research_guidance"] = json!(ZERO_WIRE_RESEARCH_GUIDANCE);
+    current
+}
+
+fn pre_zero_wire_scope(config: &AiConfig) -> Value {
     let mut current = pre_cve_now_scope(config);
     current["version"] = json!(3);
     current["research_guidance"] = json!(RESEARCH_GUIDANCE);
@@ -173,8 +181,10 @@ impl Store {
                 }
             }
             data.scope = expected.clone();
-        } else if data.scope == pre_cve_now_scope(config) {
-            // This additive source change keeps v2's enforcement contract and original review age.
+        } else if data.scope == pre_cve_now_scope(config)
+            || data.scope == pre_zero_wire_scope(config)
+        {
+            // Additive sources keep v2/v3's enforcement contract and original review age.
             // Reassess this migration before future research-guidance or validation changes.
             data.scope = expected.clone();
         }
@@ -427,78 +437,89 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v2_source_migration_preserves_entries_age_and_read_only_bytes() {
+    async fn source_migrations_preserve_entries_age_and_read_only_bytes() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("cache.json");
         let config = AiConfig::default();
         let policy = policy("2.14.1");
         let checked = now().unwrap() - 120;
-        let document = pre_source_cache(&config, checked);
-        assert_eq!(document["scope"]["version"], 2);
-        assert!(document["scope"].get("research_guidance").is_none());
-        let original: Data = serde_json::from_value(document.clone()).unwrap();
-        let before = serde_json::to_vec_pretty(&document).unwrap();
-        std::fs::write(&path, &before).unwrap();
-        let mut store = Store::load(&path, &config, ReviewTrigger::Preview { cache_only: true })
-            .await
-            .unwrap();
-        assert_eq!(store.data.scope, scope(&config));
-        assert_eq!(
-            serde_json::to_value(&store.data.entries).unwrap(),
-            serde_json::to_value(&original.entries).unwrap()
-        );
-        let mut stats = Stats::default();
-        let replies = store.reuse(&policy.report, &mut stats).unwrap();
-        assert_eq!((stats.hits, stats.misses), (1, 0));
-        assert_eq!(stats.oldest_checked_at, Some(checked));
-        assert_eq!(stats.next_refresh_at, Some(checked + config.cache_ttl_secs));
-        let original = original.entries.values().next().unwrap();
-        assert_eq!(
-            serde_json::to_value(&replies[0].reply.enhancements).unwrap(),
-            serde_json::to_value(&original.reply.enhancements).unwrap()
-        );
-        assert_eq!(
-            serde_json::to_value(&replies[0].reply.discoveries).unwrap(),
-            serde_json::to_value(&original.reply.discoveries).unwrap()
-        );
-        let mut review = Review {
-            status: Status::Complete,
-            cache: stats,
-            ..Default::default()
-        };
-        store.finish(&path, &replies, &mut review).await;
-        assert_eq!(review.cache.oldest_checked_at, Some(checked));
-        assert_eq!(
-            review.cache.next_refresh_at,
-            Some(checked + config.cache_ttl_secs)
-        );
-        assert_eq!(std::fs::read(&path).unwrap(), before);
-    }
-
-    #[tokio::test]
-    async fn v2_source_migration_does_not_revalidate_expired_or_future_reviews() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("cache.json");
-        let config = AiConfig::default();
-        let policy = policy("2.14.1");
-        let current = now().unwrap();
-        for checked in [current - config.cache_ttl_secs, current + 3600] {
-            let before = serde_json::to_vec(&pre_source_cache(&config, checked)).unwrap();
+        for previous_scope in [pre_cve_now_scope(&config), pre_zero_wire_scope(&config)] {
+            let mut document = pre_source_cache(&config, checked);
+            document["scope"] = previous_scope;
+            assert!(
+                document["scope"]
+                    .get("zero_wire_research_guidance")
+                    .is_none()
+            );
+            let original: Data = serde_json::from_value(document.clone()).unwrap();
+            let before = serde_json::to_vec_pretty(&document).unwrap();
             std::fs::write(&path, &before).unwrap();
             let mut store =
                 Store::load(&path, &config, ReviewTrigger::Preview { cache_only: true })
                     .await
                     .unwrap();
-            let mut stats = Stats::default();
-            assert!(store.reuse(&policy.report, &mut stats).unwrap().is_empty());
-            assert_eq!((stats.hits, stats.misses), (0, 1));
-            assert!(stats.oldest_checked_at.is_none());
-            assert!(stats.next_refresh_at.is_none());
+            assert_eq!(store.data.scope, scope(&config));
             assert_eq!(
-                store.data.entries.values().next().unwrap().checked_at,
-                checked
+                serde_json::to_value(&store.data.entries).unwrap(),
+                serde_json::to_value(&original.entries).unwrap()
+            );
+            let mut stats = Stats::default();
+            let replies = store.reuse(&policy.report, &mut stats).unwrap();
+            assert_eq!((stats.hits, stats.misses), (1, 0));
+            assert_eq!(stats.oldest_checked_at, Some(checked));
+            assert_eq!(stats.next_refresh_at, Some(checked + config.cache_ttl_secs));
+            let original = original.entries.values().next().unwrap();
+            assert_eq!(
+                serde_json::to_value(&replies[0].reply.enhancements).unwrap(),
+                serde_json::to_value(&original.reply.enhancements).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(&replies[0].reply.discoveries).unwrap(),
+                serde_json::to_value(&original.reply.discoveries).unwrap()
+            );
+            let mut review = Review {
+                status: Status::Complete,
+                cache: stats,
+                ..Default::default()
+            };
+            store.finish(&path, &replies, &mut review).await;
+            assert_eq!(review.cache.oldest_checked_at, Some(checked));
+            assert_eq!(
+                review.cache.next_refresh_at,
+                Some(checked + config.cache_ttl_secs)
             );
             assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn source_migrations_do_not_revalidate_expired_or_future_reviews() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache.json");
+        let config = AiConfig::default();
+        let policy = policy("2.14.1");
+        let current = now().unwrap();
+        for previous_scope in [pre_cve_now_scope(&config), pre_zero_wire_scope(&config)] {
+            for checked in [current - config.cache_ttl_secs, current + 3600] {
+                let mut document = pre_source_cache(&config, checked);
+                document["scope"] = previous_scope.clone();
+                let before = serde_json::to_vec(&document).unwrap();
+                std::fs::write(&path, &before).unwrap();
+                let mut store =
+                    Store::load(&path, &config, ReviewTrigger::Preview { cache_only: true })
+                        .await
+                        .unwrap();
+                let mut stats = Stats::default();
+                assert!(store.reuse(&policy.report, &mut stats).unwrap().is_empty());
+                assert_eq!((stats.hits, stats.misses), (0, 1));
+                assert!(stats.oldest_checked_at.is_none());
+                assert!(stats.next_refresh_at.is_none());
+                assert_eq!(
+                    store.data.entries.values().next().unwrap().checked_at,
+                    checked
+                );
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+            }
         }
     }
 
@@ -519,13 +540,21 @@ mod tests {
             ("reasoning", json!("high")),
             ("openai_url", json!("https://another-openai.example/")),
             ("anthropic_url", json!("https://another-anthropic.example/")),
-            ("version", json!(4)),
+            ("version", json!(5)),
             (
                 "research_guidance",
                 json!(format!("{RESEARCH_GUIDANCE} Changed research.")),
             ),
+            (
+                "zero_wire_research_guidance",
+                json!(format!("{ZERO_WIRE_RESEARCH_GUIDANCE} Changed research.")),
+            ),
         ];
-        for base in [pre_cve_now_scope(&config), scope(&config)] {
+        for base in [
+            pre_cve_now_scope(&config),
+            pre_zero_wire_scope(&config),
+            scope(&config),
+        ] {
             for (field, value) in &changes {
                 let mut document = pre_source_cache(&config, now().unwrap());
                 document["scope"] = base.clone();

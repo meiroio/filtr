@@ -1006,7 +1006,7 @@ fn review_text(enhancements: Value) -> String {
         .to_string()
 }
 
-fn assert_cve_now_research_guidance(instructions: &str) {
+fn assert_research_guidance(instructions: &str) {
     let guidance = instructions
         .split_once("site:cve.now")
         .expect("research must include a targeted cve.now search")
@@ -1016,6 +1016,16 @@ fn assert_cve_now_research_guidance(instructions: &str) {
     assert!(guidance.contains("check") || guidance.contains("verif"));
     assert!(guidance.contains("native web search"));
     assert!(instructions.contains("at most 3 searches per batch"));
+    let zero_wire = instructions
+        .split_once("https://radar.cloudflare.com/security/zero-wire/rss")
+        .expect("research must include the Zero Wire RSS feed")
+        .1;
+    assert!(zero_wire.contains("site:radar.cloudflare.com/security/zero-wire"));
+    assert!(zero_wire.contains("untrusted research leads"));
+    assert!(zero_wire.contains("primary vendor/project advisories"));
+    assert!(zero_wire.contains("native web search"));
+    assert!(zero_wire.contains("existing search and time budgets"));
+    assert!(zero_wire.contains("Cloudflare WAF coverage does not establish"));
 }
 
 #[tokio::test]
@@ -1034,7 +1044,7 @@ async fn anthropic_discovers_missing_cves_with_search_provenance_and_cached_cont
             async move {
                 assert_eq!(request["cache_control"]["type"], "ephemeral");
                 assert_eq!(request["system"][0]["cache_control"]["type"], "ephemeral");
-                assert_cve_now_research_guidance(request["system"][0]["text"].as_str().unwrap());
+                assert_research_guidance(request["system"][0]["text"].as_str().unwrap());
                 assert_eq!(request["tools"][0]["type"], "web_search_20250305");
                 assert_eq!(request["tools"][0]["max_uses"], 5);
                 assert_eq!(request["tools"][1]["strict"], true);
@@ -1115,7 +1125,7 @@ async fn anthropic_discovers_missing_cves_with_search_provenance_and_cached_cont
 async fn openai_discoveries_require_native_web_search_sources() {
     let directory = tempfile::tempdir().unwrap();
     let ai = Router::new().route("/v1/responses", post(|Json(request): Json<Value>| async move {
-        assert_cve_now_research_guidance(request["instructions"].as_str().unwrap());
+        assert_research_guidance(request["instructions"].as_str().unwrap());
         assert_eq!(request["tools"][0]["type"], "web_search");
         assert_eq!(request["tools"].as_array().unwrap().len(), 1);
         assert_eq!(request["max_tool_calls"], 5);
@@ -1175,7 +1185,7 @@ async fn anthropic_uses_its_ranked_model_and_native_structured_output() {
             assert_eq!(request["output_config"]["effort"], "max");
             assert_eq!(request["cache_control"]["type"], "ephemeral");
             assert_eq!(request["system"][0]["cache_control"]["type"], "ephemeral");
-            assert_cve_now_research_guidance(request["system"][0]["text"].as_str().unwrap());
+            assert_research_guidance(request["system"][0]["text"].as_str().unwrap());
             assert_eq!(request["tools"][0]["name"], "web_search");
             assert_eq!(request["tools"][0]["type"], "web_search_20250305");
             assert_eq!(request["tools"][0]["max_uses"], 5);
@@ -1291,6 +1301,7 @@ async fn leaderboard_refreshes_each_upload_and_primary_timeout_uses_luna() {
             Json(json!({"results":[{"rank":1,"modelId":format!("openai/{model}"),"reasoning":"xhigh"}]}))
         }
     })).route("/v1/responses", post(|Json(request): Json<Value>| async move {
+        assert_research_guidance(request["instructions"].as_str().unwrap());
         if request["model"] == "gpt-6-sol" {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         } else {
@@ -3150,57 +3161,63 @@ async fn cache_only_upload_replays_versions_without_external_calls_or_cache_writ
 }
 
 #[tokio::test]
-async fn previous_v2_cache_only_upload_replays_rules_without_external_calls() {
+async fn previous_source_caches_replay_rules_without_external_calls() {
     let (directory, app, calls, ranks) = cached_review_fixture().await;
     let cache_path = directory.path().join("sbom.json.ai-cache.json");
     let rankings_path = directory.path().join("sbom.json.leaderboard.json");
     let original_rules = app.status().await["policy"]["generated_rules"].clone();
     assert_eq!(original_rules.as_array().unwrap().len(), 1);
 
-    let mut previous: Value = serde_json::from_slice(&std::fs::read(&cache_path).unwrap()).unwrap();
-    let scope = previous["scope"].as_object_mut().unwrap();
-    assert!(scope.remove("research_guidance").is_some());
-    scope.insert("version".into(), json!(2));
-    let previous_bytes = serde_json::to_vec(&previous).unwrap();
-    std::fs::write(&cache_path, &previous_bytes).unwrap();
-    let modified = std::fs::metadata(&cache_path).unwrap().modified().unwrap();
+    let current: Value = serde_json::from_slice(&std::fs::read(&cache_path).unwrap()).unwrap();
     let rankings_bytes = std::fs::read(&rankings_path).unwrap();
+    for version in [2, 3] {
+        let mut previous = current.clone();
+        let scope = previous["scope"].as_object_mut().unwrap();
+        if version == 2 {
+            assert!(scope.remove("research_guidance").is_some());
+        }
+        assert!(scope.remove("zero_wire_research_guidance").is_some());
+        scope.insert("version".into(), json!(version));
+        let previous_bytes = serde_json::to_vec(&previous).unwrap();
+        std::fs::write(&cache_path, &previous_bytes).unwrap();
+        let modified = std::fs::metadata(&cache_path).unwrap().modified().unwrap();
 
-    for (sbom, expected, rules) in [
-        (PREVIEW_OLD, StatusCode::FORBIDDEN, original_rules.clone()),
-        (PREVIEW_NEW, StatusCode::CREATED, json!([])),
-        (PREVIEW_OLD, StatusCode::FORBIDDEN, original_rules),
-    ] {
-        let response = upload_options(&app, sbom, "cache_only=true").await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let report: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
-        assert_eq!(report["installed"], true);
-        assert_eq!(report["cache_only"], true);
-        assert_eq!(report["policy"]["generated_rules"], rules);
-        assert_eq!(report["policy"]["ai"]["status"], "complete");
-        assert_eq!(report["policy"]["ai"]["cache"]["hits"], 1);
-        assert_eq!(report["policy"]["ai"]["cache"]["misses"], 0);
-        assert_eq!(report["policy"]["ai"]["attempts"], json!([]));
-        assert_eq!(report["policy"]["ai"]["usage"]["web_search_requests"], 0);
+        for (sbom, expected, rules) in [
+            (PREVIEW_OLD, StatusCode::FORBIDDEN, original_rules.clone()),
+            (PREVIEW_NEW, StatusCode::CREATED, json!([])),
+            (PREVIEW_OLD, StatusCode::FORBIDDEN, original_rules.clone()),
+        ] {
+            let response = upload_options(&app, sbom, "cache_only=true").await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let report: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+            assert_eq!(report["installed"], true);
+            assert_eq!(report["cache_only"], true);
+            assert_eq!(report["policy"]["generated_rules"], rules);
+            assert_eq!(report["policy"]["ai"]["status"], "complete");
+            assert_eq!(report["policy"]["ai"]["cache"]["hits"], 1);
+            assert_eq!(report["policy"]["ai"]["cache"]["misses"], 0);
+            assert_eq!(report["policy"]["ai"]["attempts"], json!([]));
+            assert_eq!(report["policy"]["ai"]["usage"]["web_search_requests"], 0);
+            assert_eq!(
+                app.client
+                    .get(&app.public)
+                    .header("x-test-exploit", "yes")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                expected
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert_eq!(ranks.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(std::fs::read(&cache_path).unwrap(), previous_bytes);
         assert_eq!(
-            app.client
-                .get(&app.public)
-                .header("x-test-exploit", "yes")
-                .send()
-                .await
-                .unwrap()
-                .status(),
-            expected
+            std::fs::metadata(&cache_path).unwrap().modified().unwrap(),
+            modified
         );
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
-        assert_eq!(ranks.load(Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read(&rankings_path).unwrap(), rankings_bytes);
     }
-    assert_eq!(std::fs::read(&cache_path).unwrap(), previous_bytes);
-    assert_eq!(
-        std::fs::metadata(&cache_path).unwrap().modified().unwrap(),
-        modified
-    );
-    assert_eq!(std::fs::read(&rankings_path).unwrap(), rankings_bytes);
 }
 
 #[tokio::test]

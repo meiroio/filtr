@@ -1,6 +1,6 @@
 use super::{
-    AiConfig, INSTRUCTIONS, Provider, RESEARCH_GUIDANCE, Reply, models::Target, output_schema,
-    research,
+    AiConfig, INSTRUCTIONS, Provider, RESEARCH_GUIDANCE, Reply, ZERO_WIRE_RESEARCH_GUIDANCE,
+    models::Target, output_schema, research,
 };
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -150,7 +150,8 @@ fn build_request(
 }
 
 fn request_body(target: &Target, input: &str) -> Value {
-    let instructions = format!("{INSTRUCTIONS}\n\n{RESEARCH_GUIDANCE}");
+    let instructions =
+        format!("{INSTRUCTIONS}\n\n{RESEARCH_GUIDANCE}\n\n{ZERO_WIRE_RESEARCH_GUIDANCE}");
     let mut body = match target.provider {
         Provider::Openai => json!({
             "model":target.model, "reasoning":{"effort":target.reasoning}, "store":false,
